@@ -9,7 +9,7 @@ This codebase implements a full processing pipeline from raw k-space MRSI data t
 1. **SPICE reconstruction** with spatially-regularized CG solver (Toeplitz and finufft backends)
 2. **B0-corrected iterative NUFFT reconstruction** for high-fidelity spatial encoding
 3. **Analytical uncertainty quantification** via Laplacian approximation of the posterior covariance
-4. **Monte Carlo uncertainty cross-validation** for spectral fitting
+4. **Monte Carlo uncertainty cross-validation** for spectral fitting unertainty
 
 ## Repository Structure
 
