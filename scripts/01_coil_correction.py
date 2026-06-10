@@ -31,7 +31,7 @@ from warnings import filterwarnings
 filterwarnings("ignore")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from spice_mrsi.coil_sens import morse_pi
+from utils.coil_sens import morse_pi
 
 
 def parse_args():

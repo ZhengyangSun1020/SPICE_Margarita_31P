@@ -45,8 +45,8 @@ from fsl_mrs.core.nifti_mrs import gen_nifti_mrs as gen_nifti_mrs_fsl
 
 _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _root)
-from spice_mrsi.xcorr import my_mrsi_freq_align
-from spice_mrsi.utils import NUFFTOp, plot_voxel_spectrum_and_maps, read_training_data_from_csv, phase_corr, Calc_B0_matrix
+from utils.xcorr import my_mrsi_freq_align
+from utils.utils import NUFFTOp, plot_voxel_spectrum_and_maps, read_training_data_from_csv, phase_corr, Calc_B0_matrix
 
 
 def parse_args():

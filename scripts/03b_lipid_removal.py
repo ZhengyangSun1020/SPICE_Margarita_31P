@@ -36,7 +36,7 @@ from fsl_mrs.core.nifti_mrs import gen_nifti_mrs
 from fsl.data.image import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from spice_mrsi.utils import phase_corr
+from utils.utils import phase_corr
 
 
 def parse_args():

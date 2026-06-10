@@ -50,7 +50,7 @@ from fsl.data.image import Image
 from nifti_mrs.create_nmrs import gen_nifti_mrs
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from spice_mrsi.utils import (
+from utils.utils import (
     calc_Bmatrix,
     save_training_data_as_csv,
     read_training_data_from_csv,

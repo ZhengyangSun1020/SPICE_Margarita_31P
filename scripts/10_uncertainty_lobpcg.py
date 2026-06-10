@@ -48,7 +48,7 @@ from tqdm import tqdm
 from typing import Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from spice_mrsi.utils import NUFFTOp, calc_Bmatrix, read_training_data_from_csv, Calc_B0_matrix_mx
+from utils.utils import NUFFTOp, calc_Bmatrix, read_training_data_from_csv, Calc_B0_matrix_mx
 
 D_TYPE   = np.complex64
 T_D_TYPE = torch.complex64

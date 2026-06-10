@@ -41,7 +41,7 @@ from nifti_mrs.create_nmrs import gen_nifti_mrs
 from fsl_mrs.utils.misc import FIDToSpec, SpecToFID
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from spice_mrsi.utils import NUFFTOp, plot_voxel_spectrum_and_maps, read_training_data_from_csv
+from utils.utils import NUFFTOp, plot_voxel_spectrum_and_maps, read_training_data_from_csv
 
 
 def parse_args():

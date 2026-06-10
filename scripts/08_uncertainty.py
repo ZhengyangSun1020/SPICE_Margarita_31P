@@ -44,7 +44,7 @@ from scipy.sparse.linalg import LinearOperator, cg
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from spice_mrsi.utils import (
+from utils.utils import (
     NUFFTOp, calc_Bmatrix, read_training_data_from_csv, Calc_B0_matrix_mx,
 )
 

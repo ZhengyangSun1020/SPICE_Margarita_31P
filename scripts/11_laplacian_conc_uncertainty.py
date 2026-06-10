@@ -64,7 +64,7 @@ from fsl.data.image import Image
 _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _root)
 
-from spice_mrsi.xcorr import my_mrsi_freq_align
+from utils.xcorr import my_mrsi_freq_align
 
 D_TYPE = np.complex64
 

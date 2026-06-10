@@ -42,7 +42,7 @@ from fsl_mrs.core.nifti_mrs import gen_nifti_mrs
 from fsl.data.image import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from spice_mrsi.utils import phase_corr
+from utils.utils import phase_corr
 
 
 def parse_args():
@@ -627,7 +627,7 @@ def main():
         plt.close(fig)
         print("[lipidrm] Saved fig_03e_brain_mask2.png")
 
-    # ── Cell 32: phase correction via spice_mrsi.utils.phase_corr ────────────────
+    # ── Cell 32: phase correction via utils.recon.phase_corr ────────────────
     print(f"[lipidrm] Phase correction  ppmlim={args.phase_ppmlim}  method=max-real …")
     lpfree_phcorr_f = phase_corr(
         mrsi_fid_lprm_4dim[:, :, 0, :],    # (Ny, Nx, T) FID

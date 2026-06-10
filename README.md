@@ -30,7 +30,7 @@ SPICE_MARGARITA/
 │   ├── 10_uncertainty_lobpcg.py     # LOBPCG eigenvalue solver for Hessian
 │   ├── 11_laplacian_conc_uncertainty.py  # Laplacian approximation uncertainty
 │   └── 12_analytical_conc_uncertainty.py # Analytical concentration uncertainty
-├── spice_mrsi/            # Core Python package
+├── utils/                 # Core Python package
 │   ├── signal.py          # FID signal generation and phantom construction
 │   ├── simulation.py      # Synthetic B0 map and phantom simulation
 │   ├── graph.py           # Spatial graph construction and Laplacian regularization

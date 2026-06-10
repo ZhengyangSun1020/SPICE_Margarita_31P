@@ -38,7 +38,7 @@ from fsl_mrs.core.mrs import MRS, Basis
 from fsl.data.image import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from spice_mrsi.utils import phase_corr
+from utils.utils import phase_corr
 
 
 def parse_args():
@@ -228,7 +228,7 @@ def main():
         plt.close(fig)
         print("[b0_corr] Saved fig_02b_brain_mask.png")
 
-    # ── Cell 13: phase correction via spice_mrsi.utils.phase_corr ─────────────────
+    # ── Cell 13: phase correction via utils.recon.phase_corr ─────────────────
     # Notebook call: phase_corr(SpecToFID(image_blurry_numpy, axis=-1), mag_map_2d,
     #                           brain_mask, TS, (Ny, Nx), out_dir, ppmlim=(2,4), ref_img=ref_img)
     print(f"[b0_corr] Phase correction  ppmlim={args.phase_ppmlim} …")

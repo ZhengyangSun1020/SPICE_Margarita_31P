@@ -41,12 +41,12 @@ from fsl_mrs.utils.synthetic import syntheticFromBasisFile
 from fsl_mrs.core.nifti_mrs import gen_nifti_mrs
 from fsl.data.image import Image
 
-# project root → spice_mrsi package + xcorr
+# project root → utils package + xcorr
 _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _root)
 
-from spice_mrsi.xcorr import my_mrsi_freq_align
-from spice_mrsi.utils import plot_voxel_spectrum_and_maps
+from utils.xcorr import my_mrsi_freq_align
+from utils.utils import plot_voxel_spectrum_and_maps
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
