@@ -1,0 +1,106 @@
+# SPICE-MARGARITA
+
+A pipeline for *in vivo* brain 2D-MRSI reconstruction and metabolite concentration uncertainty quantification.
+
+## Overview
+
+This codebase implements a full processing pipeline from raw k-space MRSI data to quantified metabolite maps with analytical uncertainty estimates. The key contributions are:
+
+1. **SPICE reconstruction** with spatially-regularized CG solver (Toeplitz and finufft backends)
+2. **B0-corrected iterative NUFFT reconstruction** for high-fidelity spatial encoding
+3. **Analytical uncertainty quantification** via Laplacian approximation of the posterior covariance
+4. **Monte Carlo uncertainty cross-validation** for spectral fitting
+
+## Repository Structure
+
+```
+SPICE_MARGARITA/
+├── scripts/               # Numbered pipeline scripts (01–12)
+│   ├── 01_coilmap.py          # ESPIRiT coil sensitivity from pre-computed ecalib
+│   ├── 01_coil_correction.py  # MORSE-PI coil sensitivity from raw k-space
+│   ├── 02_b0_correction.py    # B0 map estimation and phase correction
+│   ├── 03_lipid_removal.py    # L2-penalized lipid suppression
+│   ├── 03b_lipid_removal.py   # Alternative lipid removal
+│   ├── 04_run_spice.py        # SPICE reconstruction with spatial constraint
+│   ├── 05_spectral_fitting.py # FSL-MRS spectral fitting
+│   ├── 06_iterative_nufft_recon.py  # Iterative NUFFT reconstruction
+│   ├── 07_adjoint_recon.py    # Adjoint NUFFT reconstruction
+│   ├── 08_uncertainty.py      # Hessian-based uncertainty (per-voxel)
+│   ├── 09_uncertainty_postproc.py   # Uncertainty post-processing
+│   ├── 10_uncertainty_lobpcg.py     # LOBPCG eigenvalue solver for Hessian
+│   ├── 11_laplacian_conc_uncertainty.py  # Laplacian approximation uncertainty
+│   └── 12_analytical_conc_uncertainty.py # Analytical concentration uncertainty
+├── spice_mrsi/            # Core Python package
+│   ├── signal.py          # FID signal generation and phantom construction
+│   ├── simulation.py      # Synthetic B0 map and phantom simulation
+│   ├── graph.py           # Spatial graph construction and Laplacian regularization
+│   ├── recon.py           # NUFFT operators, SPICE solver, B0 correction, phase correction
+│   ├── fitting.py         # Nonlinear spectral fitting and MC basis fitting
+│   ├── uncertainty.py     # Posterior covariance and uncertainty sampling
+│   ├── plotting.py        # Visualization utilities
+│   ├── io.py              # NIfTI / CSV I/O and logging
+│   ├── coil_sens.py       # MORSE-PI coil sensitivity estimation
+│   ├── xcorr.py           # Cross-correlation frequency alignment
+│   └── utils.py           # Backward-compatibility re-export shim
+├── 2pi_csap_SMF_MRSI/     # Basis set (JSON metabolite definitions)
+├── Hess10.sh              # HPC submission script for Hessian computation
+├── submit_hessian.sh      # HPC submission script
+└── submit_lobpcg.sh       # HPC submission script
+```
+
+> **Data directories** (`invivo_260305/`, `output/`, `save_iter*/`) are excluded from version control. Download or generate them separately.
+
+## Pipeline
+
+Run scripts in order from the project root:
+
+```bash
+# 1. Coil sensitivity maps
+python scripts/01_coilmap.py \
+    --data-dir ./invivo_260305/cr/ --out-dir ./output
+
+# 2. B0 correction
+python scripts/02_b0_correction.py \
+    --data-dir ./invivo_260305/cr/ --out-dir ./output
+
+# 3. Lipid removal
+python scripts/03_lipid_removal.py \
+    --data-dir ./invivo_260305/cr/ --out-dir ./output
+
+# 4. SPICE reconstruction
+python scripts/04_run_spice.py \
+    --data-dir ./invivo_260305/cr/ --basis-dir ./2pi_csap_SMF_MRSI/ \
+    --out-dir ./output --rank 20 --lambda1 1e-4
+
+# 5. Spectral fitting
+python scripts/05_spectral_fitting.py \
+    --data-dir ./invivo_260305/cr/ --out-dir ./output
+
+# 6-7. Iterative / adjoint NUFFT reconstruction
+python scripts/06_iterative_nufft_recon.py --out-dir ./output ...
+python scripts/07_adjoint_recon.py --out-dir ./output ...
+
+# 8-10. Hessian uncertainty (parallelisable over voxels)
+python scripts/08_uncertainty.py --out-dir ./output --hess-dir ./output/Hess_1e4 ...
+python scripts/10_uncertainty_lobpcg.py --hess-dir ./output/Hess_1e4 --rank 20 ...
+
+# 11-12. Concentration uncertainty maps
+python scripts/11_laplacian_conc_uncertainty.py --out-dir ./output ...
+python scripts/12_analytical_conc_uncertainty.py \
+    --data-dir ./invivo_260305/cr/ --basis-dir ./2pi_csap_SMF_MRSI/ \
+    --out-dir ./output --hess-dir ./output/Hess_1e4 --rank 20
+```
+
+## Requirements
+
+- Python ≥ 3.11
+- NumPy, SciPy, Matplotlib
+- PyTorch + [torchkbnufft](https://github.com/mmuckley/torchkbnufft)
+- [mri-nufft](https://github.com/mind-inria/mri-nufft) (finufft backend)
+- [FSL-MRS](https://open.win.ox.ac.uk/pages/fsl/fsl_mrs/)
+- [NIfTI-MRS](https://github.com/wtclarke/nifti_mrs)
+- networkx, psutil, tqdm
+
+## Citation
+
+If you use this code, please cite the associated paper (in preparation) and acknowledge this repository.
