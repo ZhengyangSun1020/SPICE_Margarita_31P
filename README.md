@@ -16,16 +16,14 @@ This codebase implements a full processing pipeline from raw k-space MRSI data t
 ```
 SPICE_MARGARITA/
 ├── scripts/               # Numbered pipeline scripts (01–12)
-│   ├── 01_coilmap.py          # ESPIRiT coil sensitivity from pre-computed ecalib
-│   ├── 01_coil_correction.py  # MORSE-PI coil sensitivity from raw k-space
+│   ├── 01_coil_correction.py  # Coil sensitivity (MORSE-PI default; RNI with --method rni)
 │   ├── 02_b0_correction.py    # B0 map estimation and phase correction
 │   ├── 03_lipid_removal.py    # L2-penalized lipid suppression
-│   ├── 03b_lipid_removal.py   # Alternative lipid removal
 │   ├── 04_run_spice.py        # SPICE reconstruction with spatial constraint
-│   ├── 05_spectral_fitting.py # FSL-MRS spectral fitting
+│   ├── 05_adjoint_recon.py    # Adjoint NUFFT reconstruction
 │   ├── 06_iterative_nufft_recon.py  # Iterative NUFFT reconstruction
-│   ├── 07_adjoint_recon.py    # Adjoint NUFFT reconstruction
-│   ├── 08_uncertainty.py      # Hessian-based uncertainty (per-voxel)
+│   ├── 07_spectral_fitting.py # FSL-MRS spectral fitting
+│   ├── 08_prefitting_uncertainty.py # Hessian-based uncertainty (per-voxel)
 │   ├── 09_uncertainty_postproc.py   # Uncertainty post-processing
 │   ├── 10_uncertainty_lobpcg.py     # LOBPCG eigenvalue solver for Hessian
 │   ├── 11_laplacian_conc_uncertainty.py  # Laplacian approximation uncertainty
@@ -91,7 +89,23 @@ python scripts/12_analytical_conc_uncertainty.py \
     --out-dir ./output --hess-dir ./output/Hess_1e4 --rank 20
 ```
 
-## Requirements
+## Installation
+
+Install all dependencies in one step:
+
+```bash
+pip install git+https://github.com/JasonLvernex/SPICE_Margarita.git
+```
+
+Or clone and install locally:
+
+```bash
+git clone https://github.com/JasonLvernex/SPICE_Margarita.git
+cd SPICE_Margarita
+pip install -e .
+```
+
+### Dependencies
 
 - Python ≥ 3.11
 - NumPy, SciPy, Matplotlib

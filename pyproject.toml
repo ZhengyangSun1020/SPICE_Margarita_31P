@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "spice-margarita"
+version = "0.1.0"
+description = "SPICE-MARGARITA: 2D MRSI reconstruction and metabolite uncertainty quantification"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "torch",
+    "torchkbnufft",
+    "mri-nufft[finufft]",
+    "fsl-mrs",
+    "nifti-mrs",
+    "networkx",
+    "psutil",
+    "tqdm",
+    "nibabel",
+]
+
+[tool.setuptools.packages.find]
+include = ["utils*"]

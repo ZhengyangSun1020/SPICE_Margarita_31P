@@ -30,6 +30,9 @@ build/
 *.swo
 *~
 
+# HPC submission scripts
+*.sh
+
 # Temporary / intermediate files
 *.tmp
 *.log
