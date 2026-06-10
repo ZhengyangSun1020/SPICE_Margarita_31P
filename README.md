@@ -28,8 +28,8 @@ This codebase implements a full processing pipeline from raw k-space MRSI data t
 SPICE_MARGARITA/
 ├── scripts/               # Numbered pipeline scripts (01–12)
 │   ├── 01_coil_correction.py        # [Optional] Coil sensitivity (MORSE-PI default; RNI with --method rni)
-│   ├── 02_B0_map_estimation.py      # B0 field map estimation and phase correction
-│   ├── 03_lipid_removal.py          # L2-penalized lipid suppression
+│   ├── 02_B0_map_estimation.py      # B0 field map estimation
+│   ├── 03_lipid_removal.py          # L2-lipid suppression
 │   ├── 04_run_spice.py              # SPICE reconstruction with spatial regularization
 │   ├── 05_adjoint_recon.py          # [Optional] Adjoint NUFFT reconstruction (diagnostic)
 │   ├── 06_iterative_nufft_recon.py  # [Optional] Iterative NUFFT reconstruction (CG + B0 correction)
