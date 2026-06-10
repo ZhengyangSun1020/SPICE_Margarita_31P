@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Step 8 — Hessian-based uncertainty quantification for SPICE.
+Step 8 — Laplacian covariance matrix (per-voxel Hessian) quantification for SPICE.
 
 For each brain voxel v, solves r CG systems H x = e_{v,r} (r = SPICE rank)
 and saves the result mHm_{v}.npy = M_v.T @ H^{-1} M_v  (r x r matrix)
@@ -15,11 +15,12 @@ Reads  : <data_dir>/wref_o.npy
 Writes : <hess_dir>/mHm_{vox}.npy  for each brain voxel
 
 Usage:
-    python scripts/08_uncertainty.py \\
-        --data-dir  ./data/ \\
-        [--out-dir  ./output] \\
-        [--hess-dir ./output/hessian] \\
-        [--rank 15] [--lambda 1e-2] [--max-workers 8]
+    python scripts/08_Laplacian_Covariance.py \
+        --data-dir  ./data/ \
+        --out-dir   ./output \
+        --hess-dir  ./output/hessian \
+        --rank 20 --lambda 1e-4 --max-workers 8 \
+        [--vox-start 0 --vox-end 100]    # optional: parallelise over voxel ranges
 """
 
 import os

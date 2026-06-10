@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Step 5 — Spectral fitting of SPICE reconstruction.
+Step 7 — Spectral fitting of SPICE reconstruction.
 
 Reads  : <out_dir>/spice/SPICE_f.npy             (raw SPICE FID from step 04)
          <data_dir>/wref_o.npy                   (water reference for brain mask)
@@ -12,11 +12,15 @@ Writes : <out_dir>/fitting/spice_aligned.nii.gz  (xcorr freq-aligned NIfTI-MRS)
          <out_dir>/fitting/fig_05_*.png
 
 Usage:
-    python scripts/05_spectral_fitting.py \\
-        --data-dir ./data/ \\
-        --basis-dir ./basis/ \\
-        --fit-basis-dir ./ISMRM2026_BASIS_fit/ \\
-        [--out-dir ./output] [--ppmlim -5 10]
+    python scripts/07_spectral_fitting.py \
+        --data-dir      ./data/ \
+        --basis-dir     ./basis/ \
+        --fit-basis-dir ./basis_fit/ \
+        --out-dir       ./output \
+        --rank 20 --dim 64 64 \
+        --combine NAA NAAG --combine PCh GPC --combine Cr PCr \
+        --plot-metabs NAA Cr Ins Glu PCh \
+        [--ppmlim 0.0 7.5]
 """
 
 import argparse

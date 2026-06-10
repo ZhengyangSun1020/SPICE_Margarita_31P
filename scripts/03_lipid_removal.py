@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Step 3b — Lipid removal (GMM + L2 only, no B0/xcorr correction).
+Step 3 — Lipid removal (GMM + L2 only, no B0/xcorr correction).
 
 Reads  : <data_dir>/mrsi_data.npy, mrsi_ksp.npy, wref_o.npy
          <out_dir>/coilmap/ecalib_pp.npy
@@ -11,10 +11,11 @@ Writes : <out_dir>/lipid_removal/kt_mrsi_lprm.npy
          <out_dir>/lipid_removal/fig_03b_*.png  (when --save-plots)
 
 Usage:
-    python scripts/03b_lipid_removal.py \\
-        --data-dir  ./data/ \\
-        [--out-dir  ./output] \\
-        [--save-plots]
+    python scripts/03_lipid_removal.py \
+        --data-dir ./data/ \
+        --out-dir  ./output \
+        --dim 64 64 --n-seq-points 300 --k-points 39842 \
+        [--lipid-beta 200] [--save-plots]
 """
 
 import argparse

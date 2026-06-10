@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Step 2 — B0 field-map estimation, following B0_corr_finufft.ipynb cell-by-cell.
+Step 2 — B0 map estimation, following B0_corr_finufft.ipynb cell-by-cell.
 
 Reads  : <data_dir>/wref_data.npy, wref_ksp.npy
          <out_dir>/coilmap/ecalib_pp.npy
@@ -11,10 +11,11 @@ Writes : <out_dir>/b0map/B0_map.npy   (= B0_map_pk.npy)
          <out_dir>/b0map/fig_02*.png   (when --save-plots)
 
 Usage:
-    python scripts/02_b0_correction.py \\
+    python scripts/02_B0_map_estimation.py \\
         --data-dir  ./data/ \\
-        --basis-dir ./Basis_Fit_ESMRMB2025/ \\
-        [--out-dir  ./output] \\
+        --basis-dir ./basis/ \\
+        --out-dir   ./output \\
+        --dim 64 64 --n-seq-points 300 --k-points 39842 \\
         [--save-plots]
 """
 

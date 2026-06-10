@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Step 12 — Analytical concentration uncertainty (Laplace approximation).
+Step 11 — Analytical concentration uncertainty (Laplace approximation).
 
 Propagates SPICE reconstruction uncertainty through the spectral fitting model
 analytically, without Monte Carlo sampling.
@@ -33,12 +33,15 @@ Writes : <out_dir>/conc_uncertainty_analytical/
              fig_12_internal_std_<metab>.png
 
 Usage:
-    python scripts/12_analytical_conc_uncertainty.py \\
-        --data-dir  ./data/ \\
-        --basis-dir ./basis/ \\
-        [--out-dir  ./output] \\
-        [--hess-dir ./output/Hess_1e4] \\
-        [--rank 20]
+    python scripts/11_analytical_conc_uncertainty.py \
+        --data-dir  ./data/ \
+        --basis-dir ./basis/ \
+        --out-dir   ./output \
+        --hess-dir  ./output/hessian \
+        --rank 20 \
+        --combine NAA NAAG --combine PCh GPC --combine Cr PCr \
+        --plot-metabs NAA Cr Ins Glu PCh \
+        [--vmax 4e-5]
 """
 
 import argparse

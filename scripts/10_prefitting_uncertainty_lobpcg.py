@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Step 10 — Low-rank Hessian uncertainty via LOBPCG (GPU-accelerated).
+Step 10 — Pre-fitting uncertainty (LOBPCG low-rank) uncertainty via LOBPCG (GPU-accelerated).
 
 Builds the full Hessian operator (same as step 08) and uses LOBPCG to find
 the k smallest eigenpairs H v = λ v.  The low-rank covariance H^{-1} ≈ Q Λ^{-1} Q^H
@@ -18,9 +18,11 @@ Writes : <out_dir>/lobpcg/lobpcg_Q.npy          (eigenvectors, shape d×k)
          <out_dir>/lobpcg/fig_10_uncert_map.png
 
 Usage:
-    python scripts/10_uncertainty_lobpcg.py \\
-        --data-dir ./data/ \\
-        [--out-dir ./output] [--rank 20] [--k-eig 50] [--n-samples 100]
+    python scripts/10_prefitting_uncertainty_lobpcg.py \
+        --data-dir ./data/ \
+        --out-dir  ./output \
+        --rank 20 --k-eig 50 --n-samples 100 \
+        [--damp 0.0] [--lobpcg-maxiter 200]
 """
 
 import os

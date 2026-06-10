@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Step 11 — Laplacian MC concentration uncertainty.
+Step 12 — Monte Carlo concentration concentration uncertainty.
 
 For each posterior SPICE sample (from Laplace approximation), runs the full
 spectral fitting pipeline (xcorr alignment + fsl_mrsi), then computes
@@ -31,11 +31,24 @@ Writes : <out_dir>/conc_uncertainty/
              fig_11_conc_std_<metab>.png
 
 Usage:
-    python scripts/11_laplacian_conc_uncertainty.py \\
-        --data-dir  ./data/ \\
-        --basis-dir ./basis/ \\
-        --fit-basis-dir ../SPICE_prototype_1/SPICE_FMRIB_J/ISMRM2026_BASIS_fit/ \\
-        [--mode lobpcg] [--out-dir ./output] [--n-samples 20]
+    # lobpcg mode (default — faster)
+    python scripts/12_MC_conc_uncertainty.py \
+        --data-dir      ./data/ \
+        --basis-dir     ./basis/ \
+        --fit-basis-dir ./basis_fit/ \
+        --out-dir       ./output \
+        --lobpcg-dir    ./output/lobpcg \
+        --mode lobpcg --rank 20 --n-samples 20 \
+        --combine NAA NAAG --combine PCh GPC --combine Cr PCr \
+        --plot-metabs NAA Cr Ins Glu PCh
+
+    # voxelwise mode
+    python scripts/12_MC_conc_uncertainty.py \
+        --data-dir  ./data/ \
+        --basis-dir ./basis/ \
+        --out-dir   ./output \
+        --hess-dir  ./output/hessian \
+        --mode voxelwise --rank 20 --n-samples 20
 """
 
 import argparse

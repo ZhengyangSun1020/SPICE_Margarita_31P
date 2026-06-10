@@ -1,50 +1,53 @@
 # SPICE-MARGARITA
 
-A pipeline for *in vivo* brain 2D-MRSI reconstruction and metabolite pre-spectral-fitting and concentration uncertainty quantification.
+A pipeline for *in vivo* brain 2D-MRSI reconstruction, spectral fitting, and metabolite concentration uncertainty quantification.
 
 ## Overview
 
-This codebase implements a full processing pipeline from raw k-space MRSI data to quantified metabolite maps with analytical uncertainty estimates. The key functionalities are:
+This codebase implements a full processing pipeline from raw k-space MRSI data to quantified metabolite maps with analytical uncertainty estimates.
 
-MRSI reconstruction methods available:
-1. **SPICE reconstruction** with spatially-regularized low-rank MRSI reconstruction (Toeplitz and finufft backends), refer:https://pubmed.ncbi.nlm.nih.gov/31483526/
-2. **B0-corrected iterative NUFFT reconstruction**
-3. **B0-corrected adjoint NUFFT reconstruction**
+### MRSI Reconstruction
 
-Spectral fitting:
-5. [**FSL_MRS MRSI fitting** ](https://open.oxcin.ox.ac.uk/pages/fsl/fsl_mrs/)
+1. **SPICE** — spatially-regularized low-rank MRSI reconstruction (Toeplitz and finufft backends). Ref: [Liang 2007](https://pubmed.ncbi.nlm.nih.gov/31483526/)
+2. **Iterative NUFFT reconstruction** — CG solver with B0 correction
+3. **Adjoint NUFFT reconstruction** — fast diagnostic reconstruction
 
-Uncertainty Quantification:
-5. **Analytical uncertainty quantification** voxel-wise Laplacian approximation of the posterior covariance (default)
-5. **LOBPCG uncertainty quantification** fast low-rank appriximation covariance
-6. **Monte Carlo uncertainty cross-validation** for spectral fitting uncertainty
+### Spectral Fitting
+
+- [**FSL-MRS**](https://open.win.ox.ac.uk/pages/fsl/fsl_mrs/) spectral fitting for quantified metabolite concentrations
+
+### Uncertainty Quantification
+
+- **Laplacian covariance** — voxel-wise Hessian-based posterior covariance (default, exact)
+- **LOBPCG** — fast low-rank approximation of the posterior covariance
+- **Monte Carlo** — concentration uncertainty via repeated spectral fitting over posterior samples
 
 ## Repository Structure
 
 ```
 SPICE_MARGARITA/
 ├── scripts/               # Numbered pipeline scripts (01–12)
-│   ├── 01_coil_correction.py  # [Optional] Coil sensitivity correction for phase-pole artefacts (MORSE-PI default; RNI with --method rni)
-│   ├── 02_b0_correction.py    # B0 map estimation
-│   ├── 03_lipid_removal.py    # L2-penalized lipid suppression
-│   ├── 04_run_spice.py        # SPICE reconstruction with spatial constraint
-│   ├── 05_adjoint_recon.py    # Adjoint NUFFT reconstruction
-│   ├── 06_iterative_nufft_recon.py  # Iterative NUFFT reconstruction
-│   ├── 07_spectral_fitting.py # FSL-MRS spectral fitting
-│   ├── 08_prefitting_uncertainty.py # voxel-wise  covariance matrix calculation via laplacian approximation
-│   ├── 09_uncertainty_postproc.py   # Voxel-wise pre-fitting uncertainty (dependent on running 08)
-│   ├── 10_uncertainty_lobpcg.py     # [Optional] faster pre-fitting uncertainty via LOBPCG low-rank approximation of the covariance matrix
-│   ├── 11_laplacian_conc_uncertainty.py  # [Optional] Monte-Carlo concentration uncertainty
-│   └── 12_analytical_conc_uncertainty.py # Analytical concentration uncertainty
+│   ├── 01_coil_correction.py        # [Optional] Coil sensitivity (MORSE-PI default; RNI with --method rni)
+│   ├── 02_B0_map_estimation.py      # B0 field map estimation and phase correction
+│   ├── 03_lipid_removal.py          # L2-penalized lipid suppression
+│   ├── 04_run_spice.py              # SPICE reconstruction with spatial regularization
+│   ├── 05_adjoint_recon.py          # Adjoint NUFFT reconstruction (diagnostic)
+│   ├── 06_iterative_nufft_recon.py  # Iterative NUFFT reconstruction (CG + B0 correction)
+│   ├── 07_spectral_fitting.py       # FSL-MRS spectral fitting
+│   ├── 08_Laplacian_Covariance.py   # Per-voxel Laplacian covariance matrix computation
+│   ├── 09_prefitting_uncertainty_laplacian.py  # Pre-fitting uncertainty (Laplacian)
+│   ├── 10_prefitting_uncertainty_lobpcg.py     # Pre-fitting uncertainty (LOBPCG, optional)
+│   ├── 11_analytical_conc_uncertainty.py       # Analytical concentration uncertainty
+│   └── 12_MC_conc_uncertainty.py               # Monte Carlo concentration uncertainty
 ├── utils/                 # Core Python package
-│   ├── signal.py          # FID signal generation and phantom construction
-│   ├── simulation.py      # Synthetic B0 map and phantom simulation
-│   ├── graph.py           # Spatial graph construction and Laplacian regularization
 │   ├── recon.py           # NUFFT operators, SPICE solver, B0 correction, phase correction
 │   ├── fitting.py         # Nonlinear spectral fitting and MC basis fitting
 │   ├── uncertainty.py     # Posterior covariance and uncertainty sampling
+│   ├── graph.py           # Spatial graph construction and Laplacian regularization
 │   ├── plotting.py        # Visualization utilities
 │   ├── io.py              # NIfTI / CSV I/O and logging
+│   ├── signal.py          # FID signal generation and phantom construction
+│   ├── simulation.py      # Synthetic B0 map and phantom simulation
 │   ├── coil_sens.py       # MORSE-PI coil sensitivity estimation
 │   ├── xcorr.py           # Cross-correlation frequency alignment
 │   └── utils.py           # Backward-compatibility re-export shim
@@ -54,8 +57,7 @@ SPICE_MARGARITA/
 └── pyproject.toml         # Package metadata and pip dependencies
 ```
 
-> **Data directories** (`data/`, `output/`, `save_iter*/`) are excluded from version control. Download or generate them separately.
-
+> **Data directories** (`data/`, `output/`, `save_iter*/`) are excluded from version control. See `data/README.md` for expected input files.
 
 ## Installation
 
@@ -90,6 +92,6 @@ pip install git+https://github.com/JasonLvernex/SPICE_Margarita.git
 
 ## Citation
 
-If you use this code, please cite the associated paper (Journal paper in preparation) and acknowledge this repository.
+If you use this code, please cite the associated paper (in preparation) and acknowledge this repository.
 
-see also: Lyu T, Jbabdi S, Clarke W, Finney S. Pipeline for Quantifying Uncertainty for SPICE Reconstructed MRSI. In: Proceedings of the Cape Town - 2026 ISMRM-ISMRT Annual Meeting and Exhibition, Cape Town, South Africa. Program #402-03-003.
+See also: Lyu T, Jbabdi S, Clarke W, Finney S. Pipeline for Quantifying Uncertainty for SPICE Reconstructed MRSI. In: Proceedings of the 2026 ISMRM-ISMRT Annual Meeting and Exhibition, Cape Town, South Africa. Program #402-03-003.

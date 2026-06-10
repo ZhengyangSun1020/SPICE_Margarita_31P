@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Step 7 — Adjoint NUFFT reconstruction from kt_mrsi_lprm.npy.
+Step 5 — Adjoint NUFFT reconstruction from kt_mrsi_lprm.npy.
 
 No Gram operator — just F^H @ y. Saves the result as NIfTI-MRS and plots
 spatial magnitude + mean spectrum over brain voxels. Use this to verify that
@@ -13,11 +13,10 @@ Outputs (in <out-dir>/adjoint_test/):
   fig_adj_center_voxel.png  — single center-voxel spectrum
 
 Usage:
-    python scripts/07_adjoint_recon.py \\
-        --data-dir ./data/ \\
-        [--out-dir ./output] \\
-        [--k-points 39762] [--n-seq-points 300] [--n-coils 32] [--n-shots 360] \\
-        [--dim 64 64] [--brain-threshold 0.08]
+    python scripts/05_adjoint_recon.py \
+        --data-dir ./data/ \
+        --out-dir  ./output \
+        --rank 20 --dim 64 64 --n-seq-points 300 --k-points 39842
 """
 
 import argparse

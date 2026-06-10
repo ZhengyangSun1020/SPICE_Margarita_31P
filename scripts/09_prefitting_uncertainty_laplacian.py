@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Step 9 — Uncertainty post-processing.
+Step 9 — Pre-fitting uncertainty (Laplacian).
 
 Supports two modes selected by --mode:
 
@@ -29,13 +29,20 @@ Writes : <out_dir>/uncertainty/fig_09_uncert_map.png
          <out_dir>/uncertainty/posterior_std.npy
 
 Usage:
-    python scripts/09_uncertainty_postproc.py \\
-        --data-dir  ./data/ \\
-        [--mode voxelwise|lobpcg] \\
-        [--out-dir  ./output] \\
-        [--hess-dir ./output/hessian]        # voxelwise mode \\
-        [--lobpcg-dir ./output/lobpcg]       # lobpcg mode \\
-        [--n-samples 100] [--voxel-x 38 --voxel-y 20]
+    # voxelwise (default) — requires step 08 hessian outputs
+    python scripts/09_prefitting_uncertainty_laplacian.py \
+        --data-dir  ./data/ \
+        --out-dir   ./output \
+        --hess-dir  ./output/hessian \
+        --rank 20 --n-samples 100
+
+    # lobpcg — requires step 10 LOBPCG outputs
+    python scripts/09_prefitting_uncertainty_laplacian.py \
+        --mode lobpcg \
+        --data-dir    ./data/ \
+        --out-dir     ./output \
+        --lobpcg-dir  ./output/lobpcg \
+        --rank 20 --n-samples 100
 """
 
 import argparse
