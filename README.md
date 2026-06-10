@@ -41,6 +41,7 @@ SPICE_MARGARITA/
 │   ├── xcorr.py           # Cross-correlation frequency alignment
 │   └── utils.py           # Backward-compatibility re-export shim
 ├── basis/                 # Basis set (JSON metabolite definitions)
+├── data/                  # Raw input data (gitignored; see data/README.md)
 ├── environment.yml        # Conda environment specification
 └── pyproject.toml         # Package metadata and pip dependencies
 ```
