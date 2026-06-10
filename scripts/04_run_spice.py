@@ -20,12 +20,12 @@ Writes : <out_dir>/spice/SPICE_result.nii.gz
 Usage:
     # Toeplitz (default)
     python scripts/04_run_spice.py \\
-        --data-dir ./invivo_260305/cr/ --basis-dir ./2pi_csap_SMF_MRSI/ \\
+        --data-dir ./data/ --basis-dir ./basis/ \\
         [--backend toeplitz] [--rank 20] [--lambda1 1e-4] [--maxiter 120]
 
     # finufft
     python scripts/04_run_spice.py \\
-        --data-dir ./invivo_260305/cr/ --basis-dir ./2pi_csap_SMF_MRSI/ \\
+        --data-dir ./data/ --basis-dir ./basis/ \\
         --backend finufft [--rank 15] [--lambda1 1e-6] [--maxiter 120]
 """
 

@@ -1,4 +1,4 @@
-name: finufft
+name: SPICE_MARGARITA
 channels:
   - https://fsl.fmrib.ox.ac.uk/fsldownloads/fslconda/public/
   - conda-forge

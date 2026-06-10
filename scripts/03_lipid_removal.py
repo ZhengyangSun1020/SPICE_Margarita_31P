@@ -12,7 +12,7 @@ Writes : <out_dir>/lipid_removal/kt_mrsi_lprm.npy
 
 Usage:
     python scripts/03b_lipid_removal.py \\
-        --data-dir  ./invivo_260305/cr/ \\
+        --data-dir  ./data/ \\
         [--out-dir  ./output] \\
         [--save-plots]
 """

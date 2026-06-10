@@ -40,12 +40,12 @@ SPICE_MARGARITA/
 │   ├── coil_sens.py       # MORSE-PI coil sensitivity estimation
 │   ├── xcorr.py           # Cross-correlation frequency alignment
 │   └── utils.py           # Backward-compatibility re-export shim
-├── 2pi_csap_SMF_MRSI/     # Basis set (JSON metabolite definitions)
+├── basis/                 # Basis set (JSON metabolite definitions)
 ├── environment.yml        # Conda environment specification
 └── pyproject.toml         # Package metadata and pip dependencies
 ```
 
-> **Data directories** (`invivo_260305/`, `output/`, `save_iter*/`) are excluded from version control. Download or generate them separately.
+> **Data directories** (`data/`, `output/`, `save_iter*/`) are excluded from version control. Download or generate them separately.
 
 ## Pipeline
 
@@ -54,33 +54,33 @@ Run scripts in order from the project root:
 ```bash
 # 01. Coil sensitivity (MORSE-PI default)
 python scripts/01_coil_correction.py \
-    --data-dir ./invivo_260305/cr/ --out-dir ./output \
+    --data-dir ./data/ --out-dir ./output \
     --n-ref 6 --max-iter 50 --calib-width 16
 
 # 02. B0 map estimation and phase correction
 python scripts/02_b0_correction.py \
-    --data-dir ./invivo_260305/cr/ --out-dir ./output
+    --data-dir ./data/ --out-dir ./output
 
 # 03. Lipid suppression
 python scripts/03_lipid_removal.py \
-    --data-dir ./invivo_260305/cr/ --out-dir ./output
+    --data-dir ./data/ --out-dir ./output
 
 # 04. SPICE reconstruction with spatial constraint
 python scripts/04_run_spice.py \
-    --data-dir ./invivo_260305/cr/ --basis-dir ./2pi_csap_SMF_MRSI/ \
+    --data-dir ./data/ --basis-dir ./basis/ \
     --out-dir ./output --rank 20 --lambda1 1e-4
 
 # 05. Adjoint NUFFT reconstruction
 python scripts/05_adjoint_recon.py \
-    --data-dir ./invivo_260305/cr/ --out-dir ./output
+    --data-dir ./data/ --out-dir ./output
 
 # 06. Iterative NUFFT reconstruction
 python scripts/06_iterative_nufft_recon.py \
-    --data-dir ./invivo_260305/cr/ --out-dir ./output
+    --data-dir ./data/ --out-dir ./output
 
 # 07. FSL-MRS spectral fitting
 python scripts/07_spectral_fitting.py \
-    --data-dir ./invivo_260305/cr/ --out-dir ./output
+    --data-dir ./data/ --out-dir ./output
 
 # 08-10. Hessian uncertainty (parallelisable over voxels)
 python scripts/08_prefitting_uncertainty.py \
@@ -91,7 +91,7 @@ python scripts/10_uncertainty_lobpcg.py \
 # 11-12. Concentration uncertainty maps
 python scripts/11_laplacian_conc_uncertainty.py --out-dir ./output ...
 python scripts/12_analytical_conc_uncertainty.py \
-    --data-dir ./invivo_260305/cr/ --basis-dir ./2pi_csap_SMF_MRSI/ \
+    --data-dir ./data/ --basis-dir ./basis/ \
     --out-dir ./output --hess-dir ./output/Hess_1e4 --rank 20
 ```
 
@@ -103,7 +103,7 @@ python scripts/12_analytical_conc_uncertainty.py \
 git clone https://github.com/JasonLvernex/SPICE_Margarita.git
 cd SPICE_Margarita
 conda env create -f environment.yml
-conda activate finufft
+conda activate SPICE_MARGARITA
 pip install -e .
 ```
 

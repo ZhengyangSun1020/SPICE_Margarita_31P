@@ -34,8 +34,8 @@ Writes : <out_dir>/conc_uncertainty_analytical/
 
 Usage:
     python scripts/12_analytical_conc_uncertainty.py \\
-        --data-dir  ./invivo_260305/cr/ \\
-        --basis-dir ./2pi_csap_SMF_MRSI/ \\
+        --data-dir  ./data/ \\
+        --basis-dir ./basis/ \\
         [--out-dir  ./output] \\
         [--hess-dir ./output/Hess_1e4] \\
         [--rank 20]

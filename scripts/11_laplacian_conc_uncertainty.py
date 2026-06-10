@@ -32,8 +32,8 @@ Writes : <out_dir>/conc_uncertainty/
 
 Usage:
     python scripts/11_laplacian_conc_uncertainty.py \\
-        --data-dir  ./invivo_260305/cr/ \\
-        --basis-dir ./2pi_csap_SMF_MRSI/ \\
+        --data-dir  ./data/ \\
+        --basis-dir ./basis/ \\
         --fit-basis-dir ../SPICE_prototype_1/SPICE_FMRIB_J/ISMRM2026_BASIS_fit/ \\
         [--mode lobpcg] [--out-dir ./output] [--n-samples 20]
 """

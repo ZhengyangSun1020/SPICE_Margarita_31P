@@ -13,8 +13,8 @@ Writes : <out_dir>/fitting/spice_aligned.nii.gz  (xcorr freq-aligned NIfTI-MRS)
 
 Usage:
     python scripts/05_spectral_fitting.py \\
-        --data-dir ./invivo_260305/cr/ \\
-        --basis-dir ./2pi_csap_SMF_MRSI/ \\
+        --data-dir ./data/ \\
+        --basis-dir ./basis/ \\
         --fit-basis-dir ./ISMRM2026_BASIS_fit/ \\
         [--out-dir ./output] [--ppmlim -5 10]
 """

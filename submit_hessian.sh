@@ -22,7 +22,7 @@ CONDA_INIT="/home/fs0/fcj757/miniforge3/etc/profile.d/conda.sh"
 CONDA_ENV="torch_env"
 
 SCRIPT_DIR="/home/fs0/fcj757/scratch/SPICE_MARGARITA/scripts"
-DATA_DIR="/home/fs0/fcj757/scratch/SPICE_MARGARITA/invivo_260305/cr/"
+DATA_DIR="/home/fs0/fcj757/scratch/SPICE_MARGARITA/data/"
 OUT_DIR="/home/fs0/fcj757/scratch/SPICE_MARGARITA/output"
 HESS_DIR="/home/fs0/fcj757/scratch/SPICE_MARGARITA/Hess_vox_batch"
 

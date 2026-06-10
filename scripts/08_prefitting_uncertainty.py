@@ -16,7 +16,7 @@ Writes : <hess_dir>/mHm_{vox}.npy  for each brain voxel
 
 Usage:
     python scripts/08_uncertainty.py \\
-        --data-dir  ./invivo_260305/cr/ \\
+        --data-dir  ./data/ \\
         [--out-dir  ./output] \\
         [--hess-dir ./output/hessian] \\
         [--rank 15] [--lambda 1e-2] [--max-workers 8]

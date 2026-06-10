@@ -19,7 +19,7 @@ Writes : <out_dir>/lobpcg/lobpcg_Q.npy          (eigenvectors, shape d×k)
 
 Usage:
     python scripts/10_uncertainty_lobpcg.py \\
-        --data-dir ./invivo_260305/cr/ \\
+        --data-dir ./data/ \\
         [--out-dir ./output] [--rank 20] [--k-eig 50] [--n-samples 100]
 """
 

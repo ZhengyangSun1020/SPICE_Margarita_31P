@@ -25,13 +25,13 @@ Both methods write: <out_dir>/coilmap/ecalib_pp.npy  (n_coils × Ny × Nx, compl
 Usage:
     # MORSE-PI (default)
     python scripts/01_coil_correction.py \\
-        --data-dir ./invivo_260305/cr/ \\
+        --data-dir ./data/ \\
         --n-ref 6 --max-iter 50 --calib-width 16 \\
         [--out-dir ./output] [--dim 64 64] [--save-plots]
 
     # RNI (2D only)
     python scripts/01_coil_correction.py \\
-        --data-dir ./invivo_260305/cr/ --method rni \\
+        --data-dir ./data/ --method rni \\
         [--out-dir ./output] [--save-plots]
 """
 

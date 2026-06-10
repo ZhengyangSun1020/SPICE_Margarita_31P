@@ -30,7 +30,7 @@ Writes : <out_dir>/uncertainty/fig_09_uncert_map.png
 
 Usage:
     python scripts/09_uncertainty_postproc.py \\
-        --data-dir  ./invivo_260305/cr/ \\
+        --data-dir  ./data/ \\
         [--mode voxelwise|lobpcg] \\
         [--out-dir  ./output] \\
         [--hess-dir ./output/hessian]        # voxelwise mode \\

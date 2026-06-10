@@ -12,7 +12,7 @@ Writes : <out_dir>/b0map/B0_map.npy   (= B0_map_pk.npy)
 
 Usage:
     python scripts/02_b0_correction.py \\
-        --data-dir  ./invivo_260305/cr/ \\
+        --data-dir  ./data/ \\
         --basis-dir ./Basis_Fit_ESMRMB2025/ \\
         [--out-dir  ./output] \\
         [--save-plots]

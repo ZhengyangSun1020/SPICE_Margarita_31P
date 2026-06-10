@@ -14,7 +14,7 @@ Outputs (in <out-dir>/adjoint_test/):
 
 Usage:
     python scripts/07_adjoint_recon.py \\
-        --data-dir ./invivo_260305/cr/ \\
+        --data-dir ./data/ \\
         [--out-dir ./output] \\
         [--k-points 39762] [--n-seq-points 300] [--n-coils 32] [--n-shots 360] \\
         [--dim 64 64] [--brain-threshold 0.08]
