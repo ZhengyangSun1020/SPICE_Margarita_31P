@@ -6,16 +6,19 @@ build-backend = "setuptools.backends.legacy:build"
 name = "spice-margarita"
 version = "0.1.0"
 description = "SPICE-MARGARITA: 2D MRSI reconstruction and metabolite uncertainty quantification"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.4.2",
     "scipy>=1.17.1",
     "matplotlib>=3.10.8",
     "torch>=2.10.0",
-    "torchkbnufft>=1.4.0",
+    "torchkbnufft==1.4.0",
     "finufft>=2.4.1",
-    "mri-nufft[finufft]>=1.4.0",
-    "fsl-mrs>=2.4.12",
+    "mri-nufft>=1.4.0",
+    # fsl-mrs must be installed via conda (see environment.yml):
+    #   conda install -c conda-forge
+    #                 -c https://fsl.fmrib.ox.ac.uk/fsldownloads/fslconda/public/
+    #                 fsl_mrs
     "nifti-mrs>=1.3.4",
     "networkx>=3.6.1",
     "nibabel>=5.3.2",

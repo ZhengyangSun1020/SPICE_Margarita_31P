@@ -91,29 +91,34 @@ python scripts/12_analytical_conc_uncertainty.py \
 
 ## Installation
 
-Install all dependencies in one step:
+**Recommended — conda (includes FSL-MRS):**
+
+```bash
+git clone https://github.com/JasonLvernex/SPICE_Margarita.git
+cd SPICE_Margarita
+conda env create -f environment.yml
+conda activate finufft
+pip install -e .
+```
+
+**pip only (FSL-MRS must be installed separately via conda):**
 
 ```bash
 pip install git+https://github.com/JasonLvernex/SPICE_Margarita.git
 ```
 
-Or clone and install locally:
-
-```bash
-git clone https://github.com/JasonLvernex/SPICE_Margarita.git
-cd SPICE_Margarita
-pip install -e .
-```
+> FSL-MRS requires a dedicated conda channel and cannot be installed via pip alone.
+> See `environment.yml` for the full conda setup.
 
 ### Dependencies
 
-- Python ≥ 3.11
+- Python ≥ 3.12
 - NumPy, SciPy, Matplotlib
 - PyTorch + [torchkbnufft](https://github.com/mmuckley/torchkbnufft)
-- [mri-nufft](https://github.com/mind-inria/mri-nufft) (finufft backend)
-- [FSL-MRS](https://open.win.ox.ac.uk/pages/fsl/fsl_mrs/)
+- [finufft](https://finufft.readthedocs.io) + [mri-nufft](https://github.com/mind-inria/mri-nufft)
+- [FSL-MRS](https://open.win.ox.ac.uk/pages/fsl/fsl_mrs/) (conda install)
 - [NIfTI-MRS](https://github.com/wtclarke/nifti_mrs)
-- networkx, psutil, tqdm
+- networkx, psutil, tqdm, nibabel
 
 ## Citation
 
