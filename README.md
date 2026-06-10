@@ -31,14 +31,14 @@ SPICE_MARGARITA/
 │   ├── 02_B0_map_estimation.py      # B0 field map estimation and phase correction
 │   ├── 03_lipid_removal.py          # L2-penalized lipid suppression
 │   ├── 04_run_spice.py              # SPICE reconstruction with spatial regularization
-│   ├── 05_adjoint_recon.py          # Adjoint NUFFT reconstruction (diagnostic)
-│   ├── 06_iterative_nufft_recon.py  # Iterative NUFFT reconstruction (CG + B0 correction)
+│   ├── 05_adjoint_recon.py          # [Optional] Adjoint NUFFT reconstruction (diagnostic)
+│   ├── 06_iterative_nufft_recon.py  # [Optional] Iterative NUFFT reconstruction (CG + B0 correction)
 │   ├── 07_spectral_fitting.py       # FSL-MRS spectral fitting
 │   ├── 08_Laplacian_Covariance.py   # Per-voxel Laplacian covariance matrix computation
 │   ├── 09_prefitting_uncertainty_laplacian.py  # Pre-fitting uncertainty (Laplacian)
-│   ├── 10_prefitting_uncertainty_lobpcg.py     # Pre-fitting uncertainty (LOBPCG, optional)
+│   ├── 10_prefitting_uncertainty_lobpcg.py     # [Optional] Pre-fitting uncertainty (LOBPCG, optional)
 │   ├── 11_analytical_conc_uncertainty.py       # Analytical concentration uncertainty
-│   └── 12_MC_conc_uncertainty.py               # Monte Carlo concentration uncertainty
+│   └── 12_MC_conc_uncertainty.py               # [Optional] Monte Carlo concentration uncertainty
 ├── utils/                 # Core Python package
 │   ├── recon.py           # NUFFT operators, SPICE solver, B0 correction, phase correction
 │   ├── fitting.py         # Nonlinear spectral fitting and MC basis fitting
