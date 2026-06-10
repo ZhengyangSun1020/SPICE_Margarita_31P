@@ -1,5 +1,8 @@
 # SPICE-MARGARITA
 
+[![License](https://img.shields.io/badge/License-Oxford%20Non--Commercial-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-%E2%89%A53.12-blue.svg)](https://www.python.org/downloads/)
+
 A pipeline for *in vivo* brain 2D-MRSI reconstruction, spectral fitting, and metabolite concentration uncertainty quantification.
 
 ## Overview
