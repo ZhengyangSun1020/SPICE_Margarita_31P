@@ -1039,3 +1039,163 @@ def SPICEWithSpatialConstrain_cg_nufft(
     print("earlystop_used:", info_dict["earlystop_used"])
 
     return spice_est, U, info_dict
+
+
+def SPICEWithSpatialConstrain_cg_nufft_joint(
+    noisy_kt_spaces: np.ndarray,
+    img_shape: Optional[tuple],
+    F: Union[np.ndarray, SciLin],
+    Gram_OP: Union[np.ndarray, SciLin],
+    F1D_OP: Union[np.ndarray, SciLin],
+    B0_mat: Union[np.ndarray, SciLin],
+    V: np.ndarray,
+    N_Vox: int,
+    rank_blocks: list,
+    WW_blocks: list,
+    lamda_blocks: list,
+    maxiter: Optional[int] = 120,
+    save_folder: str = "./saved_iters",
+    rtol: float = 1e-3,
+    x0: Optional[np.ndarray] = None,
+    brain_mask_inner: Optional[np.ndarray] = None,
+    PPM_AXIS: Optional[np.ndarray] = None,
+    patience: int = 4,
+    patience_dx: int = 3,
+) -> tuple:
+    """
+    SPICE CG solver supporting multiple rank blocks with per-block spatial regularization.
+
+    rank_blocks, WW_blocks, lamda_blocks are parallel lists — one entry per component
+    (e.g. [R_lipid, R_metab], [WW_lip, WW_met], [lam_lip, lam_met]).
+
+    Returns (spice_est, U, info_dict).
+    """
+    os.makedirs(save_folder, exist_ok=True)
+    NUM_RANK = sum(rank_blocks)
+
+    np.save(os.path.join(save_folder, 'Basis_V.npy'), V)
+
+    if x0 is None:
+        print('[SPICE-joint] Running iterative NUFFT for initial guess (30 iters)…')
+        recon_nufft, _, b_init = iterative_nufft_recon(
+            kspace=noisy_kt_spaces,
+            B0_mat=B0_mat,
+            F_OP=F,
+            Gram_OP=Gram_OP,
+            F1D_OP=F1D_OP,
+            image_shape=img_shape,
+            n_coils=32,
+            smaps=None,
+            density_method=None,
+            maxiter=30,
+            solver="cg",
+        )
+        U_init = recon_nufft.reshape(img_shape) @ np.linalg.pinv(V.conj().T)
+        x0     = U_init.ravel().astype(D_TYPE)
+        print('[SPICE-joint] Iterative NUFFT init done.')
+    else:
+        adjoint_y = F1D_OP.rmatvec(F.rmatvec(noisy_kt_spaces.ravel())).reshape(-1, img_shape[-1])
+        b_init    = (B0_mat.conj() * adjoint_y).astype(D_TYPE)
+        x0        = np.asarray(x0, dtype=D_TYPE).ravel()
+        print('[SPICE-joint] Using provided x0.')
+
+    b_flat = (b_init @ V).ravel().astype(D_TYPE)
+
+    def mv(x_vec: np.ndarray) -> np.ndarray:
+        X  = x_vec.reshape(N_Vox, NUM_RANK)
+        AA = B0_mat * (X @ V.conj().T)
+        BB = (B0_mat.conj() * (Gram_OP @ AA.ravel()).reshape(-1, V.shape[0]))
+        CC = (BB.reshape(-1, V.shape[0]) @ V).ravel()
+        DD = np.zeros((N_Vox, NUM_RANK), dtype=D_TYPE)
+        offset = 0
+        for rank, WW_b, lam in zip(rank_blocks, WW_blocks, lamda_blocks):
+            DD[:, offset:offset + rank] = lam * (WW_b @ X[:, offset:offset + rank])
+            offset += rank
+        return (CC + DD.ravel()).astype(D_TYPE)
+
+    A = SciLin(shape=(N_Vox * NUM_RANK, N_Vox * NUM_RANK), matvec=mv, dtype=D_TYPE)
+
+    iter_count       = 0
+    pbar             = tqdm(total=maxiter, desc="CG iters", unit="iter")
+    dx_tol           = 1e-6
+
+    best_x           = x0.copy()
+    Ax0              = A.matvec(x0)
+    r0               = Ax0 - b_flat
+    norm_b           = np.linalg.norm(b_flat) + 1e-16
+    best_rel_res     = np.linalg.norm(r0) / norm_b
+    best_iter        = 0
+    x_prev           = x0.copy()
+    count_no_improve = 0
+    count_small_dx   = 0
+
+    def cg_callback_internal(xk):
+        nonlocal iter_count, best_x, best_rel_res, best_iter, x_prev
+        nonlocal count_no_improve, count_small_dx
+
+        iter_count += 1
+        pbar.update(1)
+
+        Ax      = A.matvec(xk)
+        r       = Ax - b_flat
+        rel_res = np.linalg.norm(r) / norm_b
+        rel_dx  = np.linalg.norm(xk - x_prev) / (1e-16 + np.linalg.norm(xk))
+
+        rel_tol           = 5e-2
+        abs_tol           = 5e-4
+        delta             = best_rel_res - rel_res
+        required_decrease = max(rel_tol * best_rel_res, abs_tol)
+
+        if delta > required_decrease:
+            best_rel_res     = rel_res
+            best_x           = xk.copy()
+            best_iter        = iter_count
+            count_no_improve = 0
+        else:
+            count_no_improve += 1
+
+        if rel_dx < dx_tol:
+            count_small_dx += 1
+        else:
+            count_small_dx = 0
+
+        pbar.set_postfix({"rel_res": f"{rel_res:.3e}", "rel_dx": f"{rel_dx:.3e}",
+                          "best_res": f"{best_rel_res:.3e}", "cnt_no_improve": f"{count_no_improve},"})
+
+        if (iter_count >= 2) and (count_no_improve >= patience or count_small_dx >= patience_dx):
+            pbar.write(f"[earlystop] iter {iter_count}: count_no_improve={count_no_improve}, "
+                       f"count_small_dx={count_small_dx}, best_rel_res={best_rel_res:.3e}")
+            raise StopIteration("early stop (internal metrics)")
+
+        x_prev[:] = xk
+
+    try:
+        X_flat, info = cg(A, b_flat, x0=x0, rtol=rtol, maxiter=maxiter, callback=cg_callback_internal)
+    except StopIteration:
+        X_flat = best_x
+        info   = 0
+        pbar.write(f"CG stopped early; using best iterate from iter {best_iter}")
+    except Exception as e:
+        pbar.write(f"CG raised exception: {e}")
+        pbar.close()
+        raise
+    finally:
+        pbar.close()
+
+    U         = X_flat.reshape(N_Vox, NUM_RANK)
+    spice_est = U @ V.conj().T
+
+    np.save(os.path.join(save_folder, "U_final.npy"), U)
+
+    info_dict = {
+        "iterations":     iter_count,
+        "cg_info":        info,
+        "earlystop_used": (count_no_improve >= patience or count_small_dx >= patience_dx),
+    }
+
+    print("===== CG Solver Report (joint) =====")
+    print("iterations:", iter_count)
+    print("cg_info:", info)
+    print("earlystop_used:", info_dict["earlystop_used"])
+
+    return spice_est, U, info_dict

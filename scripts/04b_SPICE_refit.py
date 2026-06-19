@@ -41,10 +41,10 @@ Usage:
     python scripts/04b_SPICE_refit.py \
         --data-dir ./data/ --out-dir ./output \
         --save-plots
-    (defaults below already match the tuned command-line: --lamda-lip 1e-6
+    (defaults below already match the tuned command-line: --lamda-lip 1e-2
     --lambda1 1e-4 --maxiter 120 --nsigma-gmm-inbrain 2.0
     --n-lipid-voxels-inbrain 2000 --topn-fallback 100 --min-lip-penalty 0.001
-    --max-lip-penalty 1e2 --patience 10)
+    --max-lip-penalty 1e4 --patience 10)
 """
 
 import argparse
@@ -97,7 +97,7 @@ def parse_args():
     # SPICE / regularization
     p.add_argument("--lambda1",         type=float, default=1e-4,
                    help="Spatial reg weight for U_metab block (match step 04)")
-    p.add_argument("--lamda-lip",       type=float, default=1e-6,
+    p.add_argument("--lamda-lip",       type=float, default=1e-2,
                    help="Spatial reg weight for U_lipid block (scales WW_lip = "
                         "W_lip.H @ W_lip, built here from the in-brain GMM weight map)")
     # in-brain lipid-contamination GMM (drives W_lip; separate from step 03's
@@ -113,7 +113,7 @@ def parse_args():
                    help="W_lip diagonal weight for lipid-contaminated voxels (skull/ring + "
                         "in-brain leakage): a small floor penalty, not zero — U_lipid is "
                         "still mildly regularized there, just much less than clean voxels")
-    p.add_argument("--max-lip-penalty", type=float, default=1e2,
+    p.add_argument("--max-lip-penalty", type=float, default=1e4,
                    help="W_lip diagonal weight for clean in-brain voxels: shrinks U_lipid toward zero")
     p.add_argument("--wmax",            type=float, default=5e3)
     p.add_argument("--adj",             type=int,   default=8)

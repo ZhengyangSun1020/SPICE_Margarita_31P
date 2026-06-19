@@ -57,10 +57,10 @@ Usage:
         --data-dir ./data/ --out-dir ./output \
         --final-mode metab_only \
         --save-plots
-    (defaults below match 04b's tuned command-line: --lamda-lip 1e-6
+    (defaults below match 04b's tuned command-line: --lamda-lip 1e-2
     --lambda1 1e-4 --maxiter-lipid 120 --maxiter 120 --nsigma-gmm-inbrain 2.0
     --n-lipid-voxels-inbrain 2000 --topn-fallback 100 --min-lip-penalty 0.001
-    --max-lip-penalty 1e2 --patience 10)
+    --max-lip-penalty 1e4 --patience 10)
 """
 
 import argparse
@@ -112,7 +112,7 @@ def parse_args():
     # SPICE / regularization
     p.add_argument("--lambda1",         type=float, default=1e-4,
                    help="Spatial reg weight for U_metab block (match step 04)")
-    p.add_argument("--lamda-lip",       type=float, default=1e-6,
+    p.add_argument("--lamda-lip",       type=float, default=1e-2,
                    help="Spatial reg weight for U_lipid block in stage 1 (and stage 3 if "
                         "--final-mode joint), scales WW_lip = W_lip.H @ W_lip")
     # in-brain lipid-contamination GMM (drives W_lip; separate from step 03's
@@ -127,7 +127,7 @@ def parse_args():
     p.add_argument("--min-lip-penalty", type=float, default=0.001,
                    help="W_lip diagonal weight for lipid-contaminated voxels: a small floor "
                         "penalty, not zero — U_lipid is still mildly regularized there")
-    p.add_argument("--max-lip-penalty", type=float, default=1e2,
+    p.add_argument("--max-lip-penalty", type=float, default=1e4,
                    help="W_lip diagonal weight for clean in-brain voxels: shrinks U_lipid toward zero")
     p.add_argument("--final-mode",      choices=["metab_only", "joint"], default="metab_only",
                    help="Stage-3 refit: 'metab_only' drops the lipid block entirely (closest "
