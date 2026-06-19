@@ -60,7 +60,7 @@ def parse_args():
     p.add_argument("--dim",             type=int,   nargs=2, default=[64, 64], metavar=("NX", "NY"))
     p.add_argument("--center-freq",     type=float, default=297.219338)
     p.add_argument("--ppm-center",      type=float, default=3.027)
-    p.add_argument("--backend",         default="finufft", choices=["toeplitz", "finufft"])
+    p.add_argument("--backend",         default="finufft", choices=["torchnufft", "finufft"])
     p.add_argument("--brain-threshold", type=float, default=0.08)
     p.add_argument("--brain-erosion",   type=int,   default=3)
     p.add_argument("--rank",            type=int,   default=20)
@@ -130,7 +130,7 @@ def main():
     B0_mat  = Calc_B0_matrix(B0_map_clean, TIME_AXIS).reshape(Ny, Nx, N_SEQ)  # (Ny, Nx, N_SEQ)
     B0_FAKE = np.ones((Ny, Nx, N_SEQ), dtype=B0_mat.dtype)                    # no B0 correction
 
-    if args.backend == "toeplitz":
+    if args.backend == "torchnufft":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"[adj-test] Building toeplitz NUFFT  device={device} …")
 
@@ -188,7 +188,7 @@ def main():
     # ── Adjoint reconstruction ────────────────────────────────────────────────────
     b0_corr_mat = B0_FAKE if args.no_b0 else B0_mat   # (Ny, Nx, N_SEQ)
     print(f"[adj-test/{args.backend}] Running adjoint NUFFT  b0={'fake' if args.no_b0 else 'real'} …")
-    if args.backend == "toeplitz":
+    if args.backend == "torchnufft":
         adj_raw   = (F_OP.H @ mrsi_lprm.ravel().astype(D_TYPE)).reshape(Ny, Nx, N_SEQ)
     else:  # finufft — adj_op expects (1, N_COILS, n_total_samples)
         adj_raw   = nufft_mrsi.adj_op(mrsi_lprm.reshape(1, NUM_CMAP, -1))   # (Ny, Nx, N_SEQ) spectrum

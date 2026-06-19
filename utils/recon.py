@@ -190,6 +190,167 @@ class NUFFTLinearOperator:
                 f"n_coils={self.n_coils}, n_samples={self.n_samples})")
 
 
+# ── NUFFT backend factory ─────────────────────────────────────────────────────
+
+def build_nufft_ops(
+    backend: str,
+    trej: np.ndarray,           # (K_POINTS*N_shots, 3) float32, mrsi_ksp_scaled.T
+    im_size: tuple,             # (Ny, Nx, N_SEQ)
+    coil_smap_raw: np.ndarray,  # (n_coils, Ny, Nx)
+    n_coils: int,
+    D_TYPE=np.complex64,
+    osamp: float = 2.0,
+    ost:   float = 2.0,
+    device: str  = None,
+) -> tuple:
+    """
+    Returns (F_OP, Gram_OP, F1D, device_str).  Both backends share the same
+    scipy LinearOperator interface and FID-domain convention.
+
+    "torchnufft": torchkbnufft + Toeplitz Gram + FFT F1D (existing logic).
+    "finufft"   : mrinufft/finufft, exact Gram = lambda x: F.rmatvec(F.matvec(x)),
+                  F1D = identity (spectral FT is inside NUFFTLinearOperator).
+    """
+    Ny, Nx, N_SEQ = im_size
+    N_VOXEL = Ny * Nx
+    K_total = int(np.prod(trej.shape[:-1]))  # total k-space samples (handles 2D and 3D trej)
+
+    if device is None:
+        try:
+            import torch as _torch
+            device = "cuda" if _torch.cuda.is_available() else "cpu"
+        except ImportError:
+            device = "cpu"
+
+    from scipy.sparse.linalg import LinearOperator as _LO
+
+    if backend == "torchnufft":
+        import torch
+        import torchkbnufft as tkbn
+        T_D_TYPE = torch.complex64
+        dev = torch.device(device)
+        print(f"[nufft/torchnufft] Building Toeplitz NUFFT  device={device} …")
+
+        grid_size = (int(np.ceil(osamp * Ny)), int(np.ceil(osamp * Nx)), int(np.ceil(ost * N_SEQ)))
+        coil_smap = np.repeat(coil_smap_raw[np.newaxis, :, :, :, np.newaxis], N_SEQ, axis=-1).astype(D_TYPE)
+        ktraj     = torch.from_numpy(trej).permute(2, 0, 1).reshape(3, -1).to(dev)
+        smap_t    = torch.from_numpy(coil_smap).to(dev, dtype=T_D_TYPE)
+
+        tnufft_ob    = tkbn.KbNufft(im_size=im_size, grid_size=grid_size, dtype=T_D_TYPE).to(dev)
+        tadjnufft_ob = tkbn.KbNufftAdjoint(im_size=im_size, grid_size=grid_size, dtype=T_D_TYPE).to(dev)
+        F_tkbn = NUFFTOp(im_size=im_size, grid_size=grid_size, omega=ktraj,
+                          smaps=coil_smap, norm="ortho", device=dev,
+                          nufft_ob=tnufft_ob, adjnufft_ob=tadjnufft_ob)
+
+        toep_ob = tkbn.ToepNufft()
+        kernel  = tkbn.calc_toeplitz_kernel(ktraj, im_size, grid_size=grid_size, norm="ortho")
+
+        def _toep_mv(x_np):
+            x_t = torch.from_numpy(x_np.astype(D_TYPE)).reshape(1, 1, *im_size).to(dev, dtype=T_D_TYPE)
+            return toep_ob(x_t, kernel, smaps=smap_t, norm="ortho").squeeze().cpu().numpy().astype(D_TYPE).ravel()
+
+        Gram_OP = _LO((N_VOXEL * N_SEQ, N_VOXEL * N_SEQ), matvec=_toep_mv, dtype=D_TYPE)
+
+        def _mv(x):  return F_tkbn.A_np(x.astype(D_TYPE).reshape(Ny, Nx, N_SEQ)).ravel()
+        def _rmv(y): return F_tkbn.AH_np(y.astype(D_TYPE).reshape(n_coils, -1)).ravel()
+        F_OP = _LO((n_coils * K_total, N_VOXEL * N_SEQ), matvec=_mv, rmatvec=_rmv, dtype=D_TYPE)
+
+        def _fid2spec(x):
+            xr = np.asarray(x).reshape(Ny, Nx, N_SEQ)
+            return np.fft.fftshift(np.fft.fft(xr, axis=-1, norm='ortho'), axes=-1).ravel().astype(D_TYPE, copy=False)
+        def _spec2fid(x):
+            xr = np.asarray(x).reshape(Ny, Nx, N_SEQ)
+            return np.fft.ifft(np.fft.ifftshift(xr, axes=-1), axis=-1, norm='ortho').ravel().astype(D_TYPE, copy=False)
+        F1D = _LO((N_VOXEL * N_SEQ, N_VOXEL * N_SEQ), matvec=_fid2spec, rmatvec=_spec2fid, dtype=D_TYPE)
+
+        return F_OP, Gram_OP, F1D, device
+
+    elif backend == "finufft":
+        import mrinufft
+        print(f"[nufft/finufft] Building finufft NUFFT operator …")
+
+        coil_smap = np.repeat(coil_smap_raw[np.newaxis, :, :, :, np.newaxis], N_SEQ, axis=-1).astype(D_TYPE)
+        smap_time = coil_smap.squeeze(0)   # (n_coils, Ny, Nx, N_SEQ)
+
+        NufftOpCls = mrinufft.get_operator("finufft")
+        nufft_raw  = NufftOpCls(trej, shape=im_size, n_coils=n_coils, n_batchs=1,
+                                 squeeze_dims=True, smaps=smap_time)
+        fop        = NUFFTLinearOperator(nufft_raw, img_shape=im_size,
+                                          n_samples=K_total, n_coils=n_coils, dtype=D_TYPE)
+        F_OP_sci   = fop.to_scipy()
+
+        Gram_OP = _LO(
+            (N_VOXEL * N_SEQ, N_VOXEL * N_SEQ),
+            matvec=lambda x: F_OP_sci.rmatvec(F_OP_sci.matvec(x.astype(D_TYPE))),
+            dtype=D_TYPE,
+        )
+        _eye = lambda x: np.asarray(x, dtype=D_TYPE)
+        F1D  = _LO((N_VOXEL * N_SEQ, N_VOXEL * N_SEQ), matvec=_eye, rmatvec=_eye, dtype=D_TYPE)
+
+        return F_OP_sci, Gram_OP, F1D, "cpu"
+
+    else:
+        raise ValueError(f"Unknown NUFFT backend '{backend}'. Use 'torchnufft' or 'finufft'.")
+
+
+def build_gram_for_worker(
+    backend: str,
+    im_size: tuple,
+    D_TYPE=np.complex64,
+    # toeplitz params:
+    ktraj_np=None, grid_size=None, kernel_np=None, device_str="cpu",
+    # finufft params:
+    trej_np=None, coil_smap_raw_np=None, n_coils=None,
+    osamp: float = 2.0, ost: float = 2.0,
+):
+    """
+    Build (Gram_OP, F1D) inside a worker process.  Signature accepts both backends;
+    only the relevant params are used.
+    """
+    Ny, Nx, N_SEQ = im_size
+    N_VOXEL = Ny * Nx
+    from scipy.sparse.linalg import LinearOperator as _LO
+
+    if backend == "torchnufft":
+        import torch
+        import torchkbnufft as tkbn
+        T_D_TYPE = torch.complex64
+
+        def _toep_mv(x_np):
+            x_t = torch.tensor(x_np.astype(D_TYPE), device=device_str).unsqueeze(0).unsqueeze(0)
+            kernel_t = torch.tensor(kernel_np).to(device_str)
+            toep_ob  = tkbn.ToepNufft().to(device_str)
+            return toep_ob(x_t, kernel_t, smaps=None, norm="ortho").squeeze().cpu().numpy().astype(D_TYPE).ravel()
+
+        def _fid2spec(x):
+            xr = np.asarray(x).reshape(im_size)
+            return np.fft.fftshift(np.fft.fft(xr, axis=-1, norm='ortho'), axes=-1).ravel().astype(D_TYPE, copy=False)
+        def _spec2fid(x):
+            xr = np.asarray(x).reshape(im_size)
+            return np.fft.ifft(np.fft.ifftshift(xr, axes=-1), axis=-1, norm='ortho').ravel().astype(D_TYPE, copy=False)
+
+        n = N_VOXEL * N_SEQ
+        Gram_OP = _LO((n, n), matvec=_toep_mv, rmatvec=_toep_mv, dtype=D_TYPE)
+        F1D     = _LO((n, n), matvec=_fid2spec, rmatvec=_spec2fid, dtype=D_TYPE)
+        return Gram_OP, F1D
+
+    else:  # finufft
+        import mrinufft
+        coil_smap = np.repeat(coil_smap_raw_np[np.newaxis, :, :, :, np.newaxis], N_SEQ, axis=-1).astype(D_TYPE)
+        smap_time = coil_smap.squeeze(0)
+        NufftOpCls = mrinufft.get_operator("finufft")
+        nufft_raw  = NufftOpCls(trej_np, shape=im_size, n_coils=n_coils, n_batchs=1,
+                                 squeeze_dims=True, smaps=smap_time)
+        fop        = NUFFTLinearOperator(nufft_raw, img_shape=im_size,
+                                          n_samples=int(np.prod(trej_np.shape[:-1])), n_coils=n_coils, dtype=D_TYPE)
+        F_loc = fop.to_scipy()
+        n     = N_VOXEL * N_SEQ
+        Gram_OP = _LO((n, n), matvec=lambda x: F_loc.rmatvec(F_loc.matvec(x.astype(D_TYPE))), dtype=D_TYPE)
+        _eye    = lambda x: np.asarray(x, dtype=D_TYPE)
+        F1D     = _LO((n, n), matvec=_eye, rmatvec=_eye, dtype=D_TYPE)
+        return Gram_OP, F1D
+
+
 # ── B0 modulation matrices ────────────────────────────────────────────────────
 
 def Calc_B0_matrix(df_high, taxis):
@@ -542,20 +703,22 @@ def iterative_nufft_recon(
     def matvec_norm(x_vec):
         x_img = x_vec.reshape((-1, image_shape[-1]))
         AA = B0_mat * x_img
-        BB = B0_mat.conj() * (F1D_OP.H @ Gram_OP @ F1D_OP @ (AA.ravel())).reshape((-1, image_shape[-1]))
-        x_back = np.asarray(BB).reshape((-1, image_shape[-1]))
-        x_back = x_back.ravel().astype(D_TYPE)
-        return x_back
+        _tmp = F1D_OP.matvec(AA.ravel())
+        _tmp = Gram_OP.matvec(_tmp)
+        _tmp = F1D_OP.rmatvec(_tmp)
+        BB = B0_mat.conj() * _tmp.reshape((-1, image_shape[-1]))
+        return np.asarray(BB).ravel().astype(D_TYPE)
 
     yk = kspace.copy().astype(D_TYPE)
     if density is not None:
         yk = yk * density.reshape(1, -1)
 
-    b_img = (B0_mat.conj() * (F1D_OP.H @ F_OP.H @ (yk.ravel())).reshape((-1, image_shape[-1]))).ravel().astype(D_TYPE)
+    _adj_y = F1D_OP.rmatvec(F_OP.rmatvec(yk.ravel()))
+    b_img  = (B0_mat.conj() * _adj_y.reshape((-1, image_shape[-1]))).ravel().astype(D_TYPE)
 
     LinOp = LinearOperator((img_npix, img_npix), matvec=matvec_norm, dtype=D_TYPE)
 
-    x0_img = F1D_OP.H @ F_OP.H @ (kspace.ravel())
+    x0_img = F1D_OP.rmatvec(F_OP.rmatvec(kspace.ravel()))
     x0 = x0_img.reshape(-1).astype(D_TYPE)
 
     pbar = tqdm(total=maxiter)
@@ -757,7 +920,7 @@ def SPICEWithSpatialConstrain_cg_nufft(
         import matplotlib.pyplot as _plt
         _plt.close(fig_init)
     else:
-        adjoint_y = (F1D_OP.H @ F.H @ noisy_kt_spaces.ravel()).reshape(-1, img_shape[-1])
+        adjoint_y = F1D_OP.rmatvec(F.rmatvec(noisy_kt_spaces.ravel())).reshape(-1, img_shape[-1])
         b_init    = (B0_mat.conj() * adjoint_y).astype(D_TYPE)
         x0        = np.asarray(x0, dtype=D_TYPE).ravel()
         print('[SPICE] Using provided x0.')

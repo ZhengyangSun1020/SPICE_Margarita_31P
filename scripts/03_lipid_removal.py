@@ -8,6 +8,9 @@ Writes : <out_dir>/lipid_removal/kt_mrsi_lprm.npy
          <out_dir>/lipid_removal/mrsi_ksp_scaled.npy
          <out_dir>/lipid_removal/adj_bf_lprm.nii.gz
          <out_dir>/lipid_removal/my_mrsi_lprm_f.nii.gz
+         <out_dir>/lipid_removal/V_lipid.npy           (SVD-truncated lipid spectral subspace)
+         <out_dir>/lipid_removal/lss_map.npy           (raw LSS map, for 04b's in-brain GMM/W_lip)
+         <out_dir>/lipid_removal/kt_mrsi_withlip_noring.npy
          <out_dir>/lipid_removal/fig_03b_*.png  (when --save-plots)
 
 Usage:
@@ -22,9 +25,13 @@ Usage:
         --brain-threshold 0.00034 \
         --lipid-beta      200.0 \
         --n-lipid-voxels  500 \
-        --phase-ppmlim    3.5 5.0 \
+        --nsigma-gmm      0.2 \
+        --lipid-rank      5 \
+        --topn-fallback   100 \
+        --phase-ppmlim    3.5 3.9 \
         --plot-voxel      41 24 \
-        --save-plots
+        --save-plots \
+        --phase-method max-real
 
 """
 
@@ -48,6 +55,7 @@ from fsl.data.image import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.utils import phase_corr
+from utils.lipid import compute_lss, select_lipid_mask_gmm_simple
 
 
 def parse_args():
@@ -73,84 +81,27 @@ def parse_args():
     p.add_argument("--lss-ppm-high",     type=float, default=1.8)
     p.add_argument("--lipid-beta",       type=float, default=200.0)
     p.add_argument("--n-lipid-voxels",   type=int,   default=500)
-    p.add_argument("--nsigma-gmm",       type=float, default=0.2)
+    p.add_argument("--nsigma-gmm",       type=float, default=0.2,
+                   help="nsigma for the ring-extraction LSS GMM (selects lipid-basis voxels for SVD)")
+    p.add_argument("--topn-fallback",    type=int,   default=100,
+                   help="Top-N voxel fallback when the ring-extraction GMM threshold "
+                        "selects more than --n-lipid-voxels")
+    p.add_argument("--lipid-rank",       type=int,   default=5,
+                   help="SVD truncation rank for V_lipid (spectral subspace), default 5")
     # phase correction
-    p.add_argument("--phase-ppmlim",     type=float, nargs=2, default=[3.5, 5.0],
+    p.add_argument("--phase-ppmlim",     type=float, nargs=2, default=[3.5, 3.9],
                    metavar=("LO", "HI"))
-    p.add_argument("--phase-method",     type=str,   default="max_real",
-                   help="fsl_mrs phase correction method (default: max_real)")
+    p.add_argument("--phase-method",     type=str,   default="phasta",
+                   help="phase correction method: 'phasta', 'max-real', 'xcorr-phase', or 'none' "
+                        "(none: skip phase correction entirely; xcorr-phase: xcorr against "
+                        "brain-mean, apply only 0th-order phase, leave frequency shift for B0 "
+                        "in step 04) (default: phasta)")
     # misc
     p.add_argument("--plot-voxel",       type=int,   nargs=2, default=[41, 24],
                    metavar=("ROW", "COL"))
     p.add_argument("--ref-nii",          default=None)
     p.add_argument("--save-plots",       action="store_true")
     return p.parse_args()
-
-
-def compute_lss(data, ppm_axis, low_ppm=0.7, high_ppm=1.8):
-    lipid_idx = np.where((ppm_axis >= low_ppm) & (ppm_axis <= high_ppm))[0]
-    return np.sum(np.abs(data[..., lipid_idx]), axis=-1), lipid_idx
-
-
-def select_lipid_mask_gmm_simple(lss_map, out_dir, nsigma=0.2,
-                                  max_voxels=500, topN_fallback=100,
-                                  save_plots=False):
-    from sklearn.mixture import GaussianMixture
-    from scipy.stats import norm
-
-    lss2d = np.squeeze(np.asarray(lss_map))
-    flat  = lss2d.ravel()
-    vals  = flat[np.isfinite(flat) & (flat > 0)]
-
-    thr, method, gmm_model = None, None, None
-    try:
-        logvals = np.log(vals).reshape(-1, 1)
-        gmm     = GaussianMixture(n_components=2, random_state=0).fit(logvals)
-        means   = gmm.means_.ravel()
-        covs    = gmm.covariances_.ravel()
-        li      = int(np.argmax(means))
-        thr     = float(np.exp(means[li] - nsigma * np.sqrt(covs[li])))
-        method, gmm_model = "gmm", gmm
-    except Exception:
-        thr    = float(np.percentile(vals, 90))
-        method = "percentile"
-
-    mask = lss2d >= thr
-    nsel = int(np.sum(mask))
-
-    if nsel > max_voxels:
-        sorted_flat = np.sort(vals)[::-1]
-        thr    = float(sorted_flat[topN_fallback - 1]) if len(sorted_flat) >= topN_fallback else thr
-        mask   = lss2d >= thr
-        nsel   = int(np.sum(mask))
-        method = "topN"
-
-    if save_plots:
-        from scipy.stats import norm as _norm
-        logvals_all = np.log(np.maximum(vals, 1e-12))
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-        ax1.hist(logvals_all, bins=80, density=True, alpha=0.6, color="C0")
-        xs = np.linspace(logvals_all.min(), logvals_all.max(), 400)
-        if gmm_model is not None:
-            for mu, cov, w in zip(gmm_model.means_.ravel(),
-                                   gmm_model.covariances_.ravel(),
-                                   gmm_model.weights_.ravel()):
-                ax1.plot(xs, w * _norm.pdf(xs, loc=mu, scale=np.sqrt(cov)), lw=2)
-        ax1.axvline(np.log(thr), color="k", ls="--", label=f"thr log={np.log(thr):.3f}")
-        ax1.set_xlabel("log(LSS)")
-        ax1.legend()
-        ax1.set_title(f"LSS GMM  method={method}  n={nsel}")
-        im = ax2.imshow(lss2d, origin="lower", cmap="viridis")
-        ax2.set_title("LSS map + lipid mask")
-        plt.colorbar(im, ax=ax2, fraction=0.046)
-        for yy, xx in zip(*np.where(mask)):
-            ax2.add_patch(Rectangle((xx - 0.5, yy - 0.5), 1, 1,
-                                    edgecolor="red", facecolor="none", linewidth=1.2))
-        plt.tight_layout()
-        fig.savefig(os.path.join(out_dir, "fig_03b_lss_gmm.png"), dpi=120)
-        plt.close(fig)
-
-    return {"lipid_mask": mask, "threshold": thr, "n_selected": nsel, "method": method}
 
 
 def lipid_removal_l2(data, lipid_basis, beta):
@@ -279,10 +230,15 @@ def main():
         fig.savefig(os.path.join(out_dir, "fig_03b_lss_map.png"), dpi=120)
         plt.close(fig)
 
+    # Raw LSS map for 04b (in-brain GMM classification / W_lip now built there,
+    # next to where the joint refit's spatial regularization is assembled).
+    np.save(os.path.join(out_dir, "lss_map.npy"), np.squeeze(lss_map))
+    print("[lipidrm] Saved lss_map.npy")
+
     # ── GMM lipid mask ────────────────────────────────────────────────────────────
     res        = select_lipid_mask_gmm_simple(
         lss_map, out_dir=out_dir, nsigma=args.nsigma_gmm,
-        max_voxels=args.n_lipid_voxels, topN_fallback=100,
+        max_voxels=args.n_lipid_voxels, topN_fallback=args.topn_fallback,
         save_plots=args.save_plots,
     )
     lipid_mask = res["lipid_mask"]
@@ -298,6 +254,27 @@ def main():
     mrsi_fid_4d        = SpecToFID(image_blurry, axis=-1)[:, :, np.newaxis, :]  # (Ny,Nx,1,T) FID
     lipid_fids         = mrsi_fid_4d[lipid_mask[:, :, np.newaxis]]              # (N_vox, T)
     lipid_basis        = lipid_fids.T                                            # (T, N_vox)
+
+    # ── Save lipid basis matrix (for SVD reuse in 04b joint refit) ──────────
+    np.save(os.path.join(out_dir, "lipid_basis_matrix.npy"), lipid_basis)
+    print(f"[lipidrm] Saved lipid_basis_matrix.npy  shape={lipid_basis.shape}")
+
+    # ── SVD truncation → V_lipid (spectral subspace for 04b joint refit) ────
+    U_lip_full, s_lip_full, _ = np.linalg.svd(lipid_basis, full_matrices=False)
+    V_lipid = U_lip_full[:, :args.lipid_rank]                                    # (T, lipid_rank)
+    np.save(os.path.join(out_dir, "V_lipid.npy"), V_lipid)
+    print(f"[lipidrm] Saved V_lipid.npy  shape={V_lipid.shape}  "
+          f"top singvals={s_lip_full[:args.lipid_rank]}")
+
+    if args.save_plots:
+        fig, ax = plt.subplots(figsize=(5, 4))
+        ax.plot(s_lip_full[:30], "x-")
+        ax.axvline(args.lipid_rank - 0.5, color="r", ls="--", label=f"lipid_rank={args.lipid_rank}")
+        ax.set_title("Lipid basis singular values")
+        ax.legend()
+        plt.tight_layout()
+        fig.savefig(os.path.join(out_dir, "fig_03e_lipid_singvals.png"), dpi=120)
+        plt.close(fig)
 
     # ── Save lipid basis as NIfTI-MRS (tiled to image size) ──────────────────
     lipid_nmrs = np.tile(lipid_basis.T[np.newaxis, np.newaxis, :, :], (Nx, Ny, 1, 1))
@@ -318,23 +295,32 @@ def main():
     mrsi_lprm_masked[~brain_nolip_mask] = 0
     mrsi_lprm_4d                      = mrsi_lprm_masked[:, :, np.newaxis, :]
 
+    # ── Save lipid-free NIfTI before phase correction ─────────────────────────────
+    _pre_ph_fid = SpecToFID(mrsi_lprm_masked, axis=-1).transpose(1, 0, 2)[:, :, np.newaxis, :]
+    gen_nifti_mrs(_pre_ph_fid, dwelltime=TS, spec_freq=297.219,
+                  affine=affine).save(os.path.join(out_dir, "mrsi_lprm_pre_phcorr.nii.gz"))
+    print("[lipidrm] Saved mrsi_lprm_pre_phcorr.nii.gz")
+
     # ── Phase correction ──────────────────────────────────────────────────────────
-    print(f"[lipidrm] Phase correction  ppmlim={args.phase_ppmlim}  method={args.phase_method} …")
-    lpfree_phcorr_f = phase_corr(
-        SpecToFID(mrsi_lprm_masked, axis=-1),   # (Ny, Nx, T) FID — from masked spectrum
-        mag_map_2d = mag_map_2d,
-        brain_mask = brain_mask2,
-        TS         = TS,
-        img_shape  = (Ny, Nx),
-        out_dir    = out_dir,
-        ppmlim     = tuple(args.phase_ppmlim),
-        ref_img    = ref_img_obj,
-        out_fname  = "lpfree_phcorr_nifti",
-        method     = args.phase_method,
-    )
-    lpfree_phcorr_spec = FIDToSpec(lpfree_phcorr_f, axis=-1)        # (Ny, Nx, T)
-    mrsi_lprm_4d       = lpfree_phcorr_spec[:, :, np.newaxis, :]    # (Ny, Nx, 1, T)
-    print("[lipidrm] Phase correction done.")
+    if args.phase_method.lower() == 'none':
+        print("[lipidrm] Phase correction skipped (--phase-method none).")
+    else:
+        print(f"[lipidrm] Phase correction  ppmlim={args.phase_ppmlim}  method={args.phase_method} …")
+        lpfree_phcorr_f = phase_corr(
+            SpecToFID(mrsi_lprm_masked, axis=-1),   # (Ny, Nx, T) FID — from masked spectrum
+            mag_map_2d = mag_map_2d,
+            brain_mask = brain_mask2,
+            TS         = TS,
+            img_shape  = (Ny, Nx),
+            out_dir    = out_dir,
+            ppmlim     = tuple(args.phase_ppmlim),
+            ref_img    = ref_img_obj,
+            out_fname  = "lpfree_phcorr_nifti",
+            method     = args.phase_method,
+        )
+        lpfree_phcorr_spec = FIDToSpec(lpfree_phcorr_f, axis=-1)    # (Ny, Nx, T)
+        mrsi_lprm_4d       = lpfree_phcorr_spec[:, :, np.newaxis, :] # (Ny, Nx, 1, T)
+        print("[lipidrm] Phase correction done.")
 
     if args.save_plots:
         plot_mag_and_voxel(mrsi_lprm_4d, PPM_AXIS, vr, vc,
@@ -359,6 +345,38 @@ def main():
     gen_nifti_mrs(mrsi_lprm_f, dwelltime=TS, spec_freq=297.219,
                   affine=affine).save(os.path.join(out_dir, "my_mrsi_lprm_f.nii.gz"))
     print("[lipidrm] Saved my_mrsi_lprm_f.nii.gz")
+
+    # ── With-lipid (no ring) data for 04b joint refit ────────────────────────────
+    # Same brain_nolip_mask crop as the L2 path, but skip L2 — lipid signal still
+    # present inside the mask (only the extreme outer ring used to build the lipid
+    # basis is excluded by construction of brain_nolip_mask).
+    print("[lipidrm] Building with-lipid (no-ring) data for 04b joint refit …")
+    if args.phase_method.lower() == 'none':
+        print("[lipidrm] With-lipid phase correction skipped (--phase-method none).")
+        withlip_spec_3d = img_masked                                     # (Ny, Nx, T) spectrum
+    else:
+        withlip_phcorr_f = phase_corr(
+            SpecToFID(img_masked, axis=-1),
+            mag_map_2d = mag_map_2d,
+            brain_mask = brain_mask2,
+            TS         = TS,
+            img_shape  = (Ny, Nx),
+            out_dir    = out_dir,
+            ppmlim     = tuple(args.phase_ppmlim),
+            ref_img    = ref_img_obj,
+            out_fname  = "withlip_phcorr_nifti",
+            method     = args.phase_method,
+        )
+        withlip_spec_3d = FIDToSpec(withlip_phcorr_f, axis=-1)          # (Ny, Nx, T)
+
+    if args.save_plots:
+        plot_mag_and_voxel(withlip_spec_3d[:, :, np.newaxis, :], PPM_AXIS, vr, vc,
+                           "With-lipid (no ring), phase-corrected",
+                           os.path.join(out_dir, "fig_03d_withlip_noring.png"))
+
+    kt_mrsi_withlip = nufft_mrsi.op(withlip_spec_3d)
+    np.save(os.path.join(out_dir, "kt_mrsi_withlip_noring.npy"), kt_mrsi_withlip)
+    print(f"[lipidrm] Saved kt_mrsi_withlip_noring.npy  shape={kt_mrsi_withlip.shape}")
 
     print("[lipidrm] Done.")
 

@@ -50,7 +50,7 @@ from tqdm import tqdm
 from typing import Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils.utils import NUFFTOp, calc_Bmatrix, read_training_data_from_csv, Calc_B0_matrix_mx
+from utils.utils import NUFFTOp, calc_Bmatrix, read_training_data_from_csv, Calc_B0_matrix_mx, build_nufft_ops
 
 D_TYPE   = np.complex64
 T_D_TYPE = torch.complex64
@@ -260,6 +260,9 @@ def parse_args():
     p.add_argument("--sigma2",          type=float, default=1.0,
                    help="Posterior variance scale (set to sigma_noise^2 if available)")
     p.add_argument("--seed",            type=int,   default=0)
+    p.add_argument("--backend",         default="torchnufft",
+                   choices=["torchnufft", "finufft"],
+                   help="NUFFT backend: torchnufft (default) or finufft")
     # plot
     p.add_argument("--voxel-x",         type=int,   default=38)
     p.add_argument("--voxel-y",         type=int,   default=20)
@@ -333,27 +336,13 @@ def main():
 
     B0_mat = Calc_B0_matrix_mx(np.nan_to_num(-B0_map, nan=0.0), TIME_AXIS)  # (N_vox, N_seq)
 
-    # ── Toeplitz NUFFT (GPU if available) ─────────────────────────────────────
+    # ── NUFFT operators ───────────────────────────────────────────────────────
     trej = mrsi_ksp_scaled.T.astype(np.float32)
-    osamp, ost = 2.0, 2.0
-    grid_size  = (int(np.ceil(osamp * Ny)), int(np.ceil(osamp * Nx)),
-                  int(np.ceil(ost * N_SEQ)))
-
-    ktraj = torch.from_numpy(trej).permute(2, 0, 1).reshape(3, -1).to(device)
-    coil_smap = np.repeat(
-        coil_smap_raw[np.newaxis, :, :, :, np.newaxis], N_SEQ, axis=-1
-    ).astype(D_TYPE)
-    smap_torch = torch.tensor(coil_smap, device=device).to(T_D_TYPE)
-
-    print("[lobpcg] Computing Toeplitz kernel …")
-    kernel = tkbn.calc_toeplitz_kernel(ktraj, im_size=im_size,
-                                        grid_size=grid_size, norm="ortho")
-
-    toep_op = ToepNUFFTOp(im_size=im_size, ktraj=ktraj, grid_size=grid_size,
-                           kernel=kernel, smaps=smap_torch,
-                           device=device_str, norm="ortho")
-    F1D     = make_fft1d_op(im_size, "fid2spec")
-    Gram_OP = make_toep_linop(toep_op)
+    N_COILS_local = coil_smap_raw.shape[0]
+    _, Gram_OP, F1D, _ = build_nufft_ops(
+        args.backend, trej, im_size, coil_smap_raw, N_COILS_local, D_TYPE,
+        osamp=2.0, ost=2.0, device=device_str,
+    )
     fFHFf   = F1D.H @ Gram_OP @ F1D
     Hess_op = make_H_linop(N_VOXEL, args.rank, V, B0_mat, fFHFf, WW, args.lam)
     d       = N_VOXEL * args.rank

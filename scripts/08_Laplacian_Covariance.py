@@ -47,6 +47,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.utils import (
     NUFFTOp, calc_Bmatrix, read_training_data_from_csv, Calc_B0_matrix_mx,
+    build_gram_for_worker,
 )
 
 D_TYPE   = np.complex64
@@ -169,8 +170,10 @@ def calc_H_inv(b, H_op, d, maxiter=120, rtol=1e-3):
 
 # ── Worker (per-process globals) ──────────────────────────────────────────────
 
-def init_worker(V_, B0_mat_, WW_, ktraj_, im_size_, grid_size_, kernel_,
-                rank_, N_vox_, lam_, hess_dir_, device_str_, D_TYPE_, MITER_):
+def init_worker(V_, B0_mat_, WW_, backend_,
+                ktraj_np_, im_size_, grid_size_, kernel_np_, device_str_,
+                trej_np_, coil_smap_raw_np_, n_coils_,
+                rank_, N_vox_, lam_, hess_dir_, D_TYPE_, MITER_):
     global V, B0_mat, WW, NUM_SPICE_RANK, N_VOXEL, lam, hess_dir, D_TYPE, MITER
     global Hess_op
 
@@ -185,14 +188,14 @@ def init_worker(V_, B0_mat_, WW_, ktraj_, im_size_, grid_size_, kernel_,
     MITER          = MITER_
 
     im_size   = tuple(im_size_)
-    grid_size = tuple(grid_size_)
-    F1D       = make_fft1d_op(im_size, "fid2spec")
-
-    toep_op   = ToepNUFFTOp(im_size=im_size, ktraj=ktraj_, grid_size=grid_size,
-                             kernel=kernel_, smaps=None, device=device_str_, norm="ortho")
-    Gram_OP   = make_toep_linop(toep_op)
-    fFHFf     = F1D.H @ Gram_OP @ F1D
-    Hess_op   = make_H_linop(N_VOXEL, NUM_SPICE_RANK, V, B0_mat, fFHFf, WW, lam)
+    Gram_OP, F1D = build_gram_for_worker(
+        backend_, im_size, D_TYPE,
+        ktraj_np=ktraj_np_, grid_size=tuple(grid_size_) if grid_size_ is not None else None,
+        kernel_np=kernel_np_, device_str=device_str_,
+        trej_np=trej_np_, coil_smap_raw_np=coil_smap_raw_np_, n_coils=n_coils_,
+    )
+    fFHFf   = F1D.H @ Gram_OP @ F1D
+    Hess_op = make_H_linop(N_VOXEL, NUM_SPICE_RANK, V, B0_mat, fFHFf, WW, lam)
 
 
 def solve_one_voxel(vox_idx):
@@ -228,6 +231,9 @@ def parse_args():
     p = argparse.ArgumentParser(description="SPICE Hessian uncertainty — step 8")
     p.add_argument("--data-dir",      required=True)
     p.add_argument("--out-dir",       default="./output")
+    p.add_argument("--backend",       default="torchnufft",
+                   choices=["torchnufft", "finufft"],
+                   help="NUFFT backend: torchnufft (default) or finufft")
     p.add_argument("--hess-dir",      default=None,
                    help="Output directory for mHm_*.npy (default: <out-dir>/hessian)")
     p.add_argument("--dwelltime",     type=float, default=5e-6)
@@ -323,39 +329,39 @@ def main():
     print(f"[uncert] WW shape={WW.shape}")
 
     # ── Trajectory & coil maps ────────────────────────────────────────────────
-    trej  = mrsi_ksp_scaled.T.astype(np.float32)              # (N_shots*K, 3)
-    im_size   = (Ny, Nx, N_SEQ)
+    trej_np  = mrsi_ksp_scaled.T.astype(np.float32)              # (N_shots*K, 3)
+    im_size  = (Ny, Nx, N_SEQ)
+    coil_smap_np = coil_smap_raw                                  # (C, Ny, Nx)
     osamp, ost = 2.0, 2.0
     grid_size  = (int(np.ceil(osamp * Ny)),
                   int(np.ceil(osamp * Nx)),
-                  int(np.ceil(ost   * N_SEQ)))
+                  int(np.ceil(ost   * N_SEQ))) if args.backend == "torchnufft" else None
 
-    ktraj_torch = torch.from_numpy(trej).permute(2, 0, 1).reshape(3, -1).to(device)
-
-    # coil_smap_raw: (C, Ny, Nx) → (1, C, Ny, Nx, N_SEQ)
-    coil_smap = np.repeat(
-        coil_smap_raw[np.newaxis, :, :, :, np.newaxis], N_SEQ, axis=-1
-    ).astype(D_TYPE)
-    smap_torch = torch.tensor(coil_smap, device=device).to(T_D_TYPE)
-
-    # ── Toeplitz kernel (computed once, shared with workers) ──────────────────
-    print("[uncert] Computing Toeplitz kernel …")
-    kernel = tkbn.calc_toeplitz_kernel(
-        ktraj_torch, im_size=im_size, grid_size=grid_size, norm="ortho"
-    ).to(device)
-    kernel_np = kernel.cpu().numpy()
-    ktraj_np  = ktraj_torch.cpu().numpy()
-    print("[uncert] Kernel computed.")
+    if args.backend == "torchnufft":
+        ktraj_torch = torch.from_numpy(trej_np).permute(2, 0, 1).reshape(3, -1).to(device)
+        print("[uncert] Computing Toeplitz kernel …")
+        kernel = tkbn.calc_toeplitz_kernel(
+            ktraj_torch, im_size=im_size, grid_size=grid_size, norm="ortho"
+        ).to(device)
+        kernel_np = kernel.cpu().numpy()
+        ktraj_np  = ktraj_torch.cpu().numpy()
+        print("[uncert] Kernel computed.")
+    else:
+        kernel_np  = None
+        ktraj_np   = None
+        device_str = "cpu"
+        print("[uncert] Using finufft backend (no Toeplitz kernel needed).")
 
     # ── Quick in-process check: build once to verify shapes ───────────────────
-    F1D     = make_fft1d_op(im_size, "fid2spec")
-    toep_op = ToepNUFFTOp(im_size=im_size, ktraj=ktraj_torch, grid_size=grid_size,
-                           kernel=kernel, smaps=smap_torch, norm="ortho")
-    Gram_OP = make_toep_linop(toep_op)
-    fFHFf   = F1D.H @ Gram_OP @ F1D
-    Hess_op = make_H_linop(N_VOXEL, args.rank, V, B0_mat, fFHFf, WW, args.lam)
-    print(f"[uncert] Hessian shape={Hess_op.shape}  (N_vox*rank={N_VOXEL*args.rank})")
-    del F1D, toep_op, Gram_OP, fFHFf, Hess_op   # free; workers rebuild
+    _Gram, _F1D = build_gram_for_worker(
+        args.backend, im_size, D_TYPE,
+        ktraj_np=ktraj_np, grid_size=grid_size, kernel_np=kernel_np, device_str=device_str,
+        trej_np=trej_np, coil_smap_raw_np=coil_smap_np, n_coils=N_COILS,
+    )
+    _fFHFf  = _F1D.H @ _Gram @ _F1D
+    _Hess   = make_H_linop(N_VOXEL, args.rank, V, B0_mat, _fFHFf, WW, args.lam)
+    print(f"[uncert] Hessian shape={_Hess.shape}  (N_vox*rank={N_VOXEL*args.rank})")
+    del _Gram, _F1D, _fFHFf, _Hess
 
     # ── Parallel voxel CG ─────────────────────────────────────────────────────
     vox_list = np.flatnonzero(brain_mask.ravel())[args.vox_start:args.vox_end]
@@ -366,9 +372,10 @@ def main():
         max_workers=args.max_workers,
         initializer=init_worker,
         initargs=(
-            V, B0_mat, WW,
-            ktraj_np, im_size, grid_size, kernel_np,
-            args.rank, N_VOXEL, args.lam, hess_dir, "cpu",
+            V, B0_mat, WW, args.backend,
+            ktraj_np, im_size, grid_size, kernel_np, device_str,
+            trej_np, coil_smap_np, N_COILS,
+            args.rank, N_VOXEL, args.lam, hess_dir,
             D_TYPE, args.cg_maxiter,
         ),
     ) as ex:

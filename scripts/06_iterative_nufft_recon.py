@@ -7,7 +7,7 @@ Result x is in FID domain, saved as NIfTI-MRS for downstream use
 (xcorr alignment + spectral fitting in step 05).
 
 Backends:
-  toeplitz (default) : torchkbnufft + Toeplitz Gram  — fast per CG iter
+  torchnufft (default) : torchkbnufft + Toeplitz Gram  — fast per CG iter
   finufft            : mrinufft finufft, Gram = F.H@F — no torch dep, slower
 
 Reads  : <out_dir>/lipid_removal/kt_mrsi_lprm.npy
@@ -60,8 +60,8 @@ def parse_args():
     p = argparse.ArgumentParser(description="Iterative NUFFT reconstruction — step 6")
     p.add_argument("--data-dir",        required=True)
     p.add_argument("--out-dir",         default="./output")
-    p.add_argument("--backend",         default="toeplitz",
-                   choices=["toeplitz", "finufft"])
+    p.add_argument("--backend",         default="torchnufft",
+                   choices=["torchnufft", "finufft"])
     p.add_argument("--dwelltime",       type=float, default=5e-6)
     p.add_argument("--k-points",        type=int,   default=39762)
     p.add_argument("--n-seq-points",    type=int,   default=300)
@@ -130,7 +130,7 @@ def main():
     brain_mask_inner = binary_erosion(brain_mask, iterations=args.brain_erosion)
 
     # ── Build NUFFT operators ─────────────────────────────────────────────────
-    if args.backend == "toeplitz":
+    if args.backend == "torchnufft":
         import torch
         import torchkbnufft as tkbn
 

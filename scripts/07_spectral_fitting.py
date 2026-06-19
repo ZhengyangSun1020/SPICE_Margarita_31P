@@ -2,7 +2,8 @@
 """
 Step 7 — Spectral fitting of SPICE reconstruction.
 
-Reads  : <out_dir>/spice/SPICE_f.npy             (raw SPICE FID from step 04)
+Reads  : <out_dir>/spice/SPICE_f.npy             (raw SPICE FID from step 04, default)
+         OR --spice-npy <path>                   (e.g. spice_refit_uoss/SPICE_refit_f.npy from 04c)
          <data_dir>/wref_o.npy                   (water reference for brain mask)
          <fit-basis-dir>/                         (FSL-MRS fitting basis)
 Writes : <out_dir>/fitting/spice_aligned.nii.gz  (xcorr freq-aligned NIfTI-MRS)
@@ -15,11 +16,11 @@ Usage:
     python scripts/07_spectral_fitting.py \
         --data-dir      ./data/ \
         --basis-dir     ./basis/ \
-        --fit-basis-dir ./basis_fit/ \
         --out-dir       ./output \
-        --rank 20 --dim 64 64 \
+        --spice-npy     ./output/spice_refit_uoss/SPICE_refit_f.npy \
+        --dim 64 64 \
         --combine NAA NAAG --combine PCh GPC --combine Cr PCr \
-        --plot-metabs NAA Cr Ins Glu PCh \
+        [--plot-metabs NAA Cr Ins Glu PCh]
         [--ppmlim 0.0 7.5]
 """
 
@@ -129,6 +130,10 @@ def parse_args():
     p.add_argument("--fit-basis-dir",    default=None,
                    help="Fitting basis directory for fsl_mrsi (defaults to --basis-dir)")
     p.add_argument("--out-dir",          default="./output")
+    p.add_argument("--spice-npy",        default=None,
+                   help="Path to SPICE FID .npy (overrides default "
+                        "<out_dir>/spice/SPICE_f.npy; use for 04c output: "
+                        "<out_dir>/spice_refit_uoss/SPICE_refit_f.npy)")
     p.add_argument("--ref-nii",          default=None,
                    help="Reference NIfTI for affine (optional)")
     # Spectral / acquisition (must match step 04)
@@ -192,11 +197,11 @@ def main():
         affine  = np.eye(4)
 
     # ── Load raw SPICE FID ────────────────────────────────────────────────────
-    spice_f_path = os.path.join(spice_dir, "SPICE_f.npy")
+    spice_f_path = args.spice_npy or os.path.join(spice_dir, "SPICE_f.npy")
     if not os.path.exists(spice_f_path):
         raise FileNotFoundError(
-            f"SPICE_f.npy not found at {spice_f_path}\n"
-            "Run step 04 (04_run_spice.py) first."
+            f"SPICE FID not found at {spice_f_path}\n"
+            "Run step 04 (04_run_spice.py) or pass --spice-npy to a 04c output."
         )
     print(f"[fitting] Loading {spice_f_path} ...")
     spice_est = np.load(spice_f_path)               # (N_Vox, N_SEQ) or (Ny*Nx, N_SEQ)

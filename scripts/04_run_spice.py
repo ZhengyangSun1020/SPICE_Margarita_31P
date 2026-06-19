@@ -3,8 +3,8 @@
 Step 4 — SPICE reconstruction with spatial regularization.
 
 Two backends available via --backend:
-  toeplitz  (default) : torchkbnufft + Toeplitz Gram — faster per CG iter, needs torch
-  finufft             : mrinufft finufft, Gram = F.H@F — no torch dep, has early-stop CG
+  torchnufft  (default) : torchkbnufft + Toeplitz Gram — faster per CG iter, needs torch
+  finufft               : mrinufft finufft, Gram = F.H@F — no torch dep
 
 Reads  : <data_dir>/wref_o.npy
          <out_dir>/coilmap/ecalib_pp.npy
@@ -18,10 +18,10 @@ Writes : <out_dir>/spice/SPICE_result.nii.gz
          <out_dir>/spice/V_subspace.npy
 
 Usage:
-    # Toeplitz (default)
+    # torchnufft (default)
     python scripts/04_run_spice.py \\
         --data-dir ./data/ --basis-dir ./basis/ \\
-        [--backend toeplitz] [--rank 20] [--lambda1 1e-4] [--maxiter 120]
+        [--backend torchnufft] [--rank 20] [--lambda1 1e-4] [--maxiter 120]
 
     # finufft
     python scripts/04_run_spice.py \\
@@ -56,7 +56,6 @@ from utils.utils import (
     read_training_data_from_csv,
     Sig_func_Multi_Peak_2D,
     SPICEWithSpatialConstrain_cg_nufft,
-    SPICEWithSpatialConstrain_cg_finufft,
     NUFFTLinearOperator,
     plot_voxel_spectrum_and_maps,
     plot_anatomical_mask_points_size_directional,
@@ -64,6 +63,7 @@ from utils.utils import (
     Calc_B0_matrix,
     NUFFTOp,
     phase_corr,
+    build_nufft_ops,
 )
 
 
@@ -72,9 +72,9 @@ def parse_args():
     p.add_argument("--data-dir",        required=True)
     p.add_argument("--basis-dir",       required=True)
     p.add_argument("--out-dir",         default="./output")
-    p.add_argument("--backend",         default="toeplitz",
-                   choices=["toeplitz", "finufft"],
-                   help="NUFFT backend: toeplitz (default) or finufft")
+    p.add_argument("--backend",         default="torchnufft",
+                   choices=["torchnufft", "finufft"],
+                   help="NUFFT backend: torchnufft (default) or finufft")
     p.add_argument("--dwelltime",       type=float, default=5e-6)
     p.add_argument("--k-points",        type=int,   default=39762)
     p.add_argument("--n-seq-points",    type=int,   default=300)
@@ -83,7 +83,7 @@ def parse_args():
     p.add_argument("--center-freq",     type=float, default=297.219338)
     p.add_argument("--ppm-center",      type=float, default=3.027)
     p.add_argument("--n-shots",         type=int,   default=360,
-                   help="Number of shots (toeplitz only, default: 360)")
+                   help="Number of shots (torchnufft only, default: 360)")
     p.add_argument("--phase-ppmlim",    type=float, nargs=2, default=[0.0, 5.0], metavar=("LO","HI"))
     # SPICE
     p.add_argument("--rank",            type=int,   default=20)
@@ -175,69 +175,11 @@ def main():
     brain_mask       = wref_norm > args.brain_threshold
     brain_mask_inner = binary_erosion(brain_mask, iterations=args.brain_erosion)
 
-    # ── Build NUFFT operators (backend-specific) ──────────────────────────────────
-    if args.backend == "toeplitz":
-        import torch
-        import torchkbnufft as tkbn
-
-        device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        T_D_TYPE   = torch.complex64
-        print(f"[spice/toeplitz] Building Toeplitz NUFFT  device={device} …")
-
-        osamp, ost = 2.0, 2.0
-        grid_size  = (int(np.ceil(osamp * Ny)),
-                      int(np.ceil(osamp * Nx)),
-                      int(np.ceil(ost * T)))
-
-        ktraj      = torch.from_numpy(trej).permute(2, 0, 1).reshape(3, -1).to(device)
-        smap_torch = torch.from_numpy(coil_smap).to(device, dtype=T_D_TYPE)
-        tnufft_ob  = tkbn.KbNufft(im_size=im_size, grid_size=grid_size, dtype=T_D_TYPE).to(device)
-        tadjnufft_ob = tkbn.KbNufftAdjoint(im_size=im_size, grid_size=grid_size, dtype=T_D_TYPE).to(device)
-
-        F_tkbn = NUFFTOp(
-            im_size=im_size, grid_size=grid_size,
-            omega=ktraj, smaps=coil_smap,
-            norm="ortho", device=device,
-            nufft_ob=tnufft_ob, adjnufft_ob=tadjnufft_ob,
-        )
-
-        toep_ob = tkbn.ToepNufft()
-        kernel  = tkbn.calc_toeplitz_kernel(ktraj, im_size, grid_size=grid_size, norm="ortho")
-
-        def toep_matvec(x_np):
-            x_t = torch.from_numpy(x_np.astype(D_TYPE)).reshape(1, 1, *im_size).to(device, dtype=T_D_TYPE)
-            return toep_ob(x_t, kernel, smaps=smap_torch, norm="ortho").squeeze().cpu().numpy().astype(D_TYPE).ravel()
-
-        Gram_OP = LinearOperator((N_VOXEL * N_SEQ, N_VOXEL * N_SEQ), matvec=toep_matvec, dtype=D_TYPE)
-
-        def _mv(x):  return F_tkbn.A_np(x.astype(D_TYPE).reshape(Ny, Nx, N_SEQ)).ravel()
-        def _rmv(y): return F_tkbn.AH_np(y.astype(D_TYPE).reshape(NUM_CMAP, -1)).ravel()
-        F_OP = LinearOperator(
-            (K_POINTS * N_COILS * args.n_shots, N_VOXEL * N_SEQ),
-            matvec=_mv, rmatvec=_rmv, dtype=D_TYPE,
-        )
-        def _fid2spec(x):
-            xr = np.asarray(x).reshape(Ny, Nx, N_SEQ)
-            return np.fft.fftshift(np.fft.fft(xr, axis=-1, norm='ortho'), axes=-1).ravel().astype(D_TYPE, copy=False)
-
-        def _spec2fid(x):
-            xr = np.asarray(x).reshape(Ny, Nx, N_SEQ)
-            return np.fft.ifft(np.fft.ifftshift(xr, axes=-1), axis=-1, norm='ortho').ravel().astype(D_TYPE, copy=False)
-
-        F1D = LinearOperator(
-            (N_VOXEL * N_SEQ, N_VOXEL * N_SEQ),
-            matvec=_fid2spec, rmatvec=_spec2fid, dtype=D_TYPE,
-        )
-
-    else:  # finufft
-        print("[spice/finufft] Building finufft NUFFT operator …")
-        NufftOp    = mrinufft.get_operator("finufft")
-        nufft_mrsi = NufftOp(trej, shape=im_size, n_coils=NUM_CMAP,
-                              n_batchs=1, squeeze_dims=True, smaps=smap_time)
-        fop  = NUFFTLinearOperator(nufft_mrsi, img_shape=im_size,
-                                   n_samples=mrsi_lprm.shape[1],
-                                   n_coils=mrsi_lprm.shape[0])
-        F_OP = fop.to_scipy()
+    # ── Build NUFFT operators ─────────────────────────────────────────────────────
+    F_OP, Gram_OP, F1D, device_str = build_nufft_ops(
+        args.backend, trej, im_size, coil_smap_raw, NUM_CMAP, D_TYPE,
+        osamp=2.0, ost=2.0,
+    )
 
     # ── B0 modulation matrix ─────────────────────────────────────────────────────
     print("[spice] Building B0 modulation matrix …")
@@ -323,32 +265,20 @@ def main():
         fig.savefig(os.path.join(out_dir, "fig_04a_subspace.png"), dpi=120)
         plt.close(fig)
 
-    # ── Run SPICE (backend-specific) ──────────────────────────────────────────────
+    # ── Run SPICE ─────────────────────────────────────────────────────────────────
     print(f"[spice/{args.backend}] Running SPICE  rank={args.rank}  λ={args.lambda1}  maxiter={args.maxiter} …")
 
-    if args.backend == "toeplitz":
-        spice_est, est_U, _ = SPICEWithSpatialConstrain_cg_nufft(
-            noisy_kt_spaces  = mrsi_lprm,
-            img_shape        = im_size,
-            F=F_OP, Gram_OP=Gram_OP, F1D_OP=F1D,
-            B0_mat=B0_mat, V=V,
-            N_Vox=N_VOXEL, NUM_SPICE_RANK=args.rank,
-            WW=WW, Solver="cg",
-            lamda_1=args.lambda1, maxiter=args.maxiter,
-            brain_mask_inner = brain_mask_inner,
-            PPM_AXIS         = PPM_AXIS,
-        )
-    else:  # finufft
-        spice_est, est_U, _ = SPICEWithSpatialConstrain_cg_finufft(
-            noisy_kt_spaces=mrsi_lprm,
-            img_shape=im_size,
-            F=F_OP,
-            B0_mat=B0_mat, V=V,
-            N_Vox=N_VOXEL, NUM_SPICE_RANK=args.rank,
-            WW=WW,
-            lamda_1=args.lambda1, maxiter=args.maxiter,
-            save_folder=os.path.join(out_dir, "cg_iters"),
-        )
+    spice_est, est_U, _ = SPICEWithSpatialConstrain_cg_nufft(
+        noisy_kt_spaces  = mrsi_lprm,
+        img_shape        = im_size,
+        F=F_OP, Gram_OP=Gram_OP, F1D_OP=F1D,
+        B0_mat=B0_mat, V=V,
+        N_Vox=N_VOXEL, NUM_SPICE_RANK=args.rank,
+        WW=WW, Solver="cg",
+        lamda_1=args.lambda1, maxiter=args.maxiter,
+        brain_mask_inner = brain_mask_inner,
+        PPM_AXIS         = PPM_AXIS,
+    )
 
     print(f"[spice] Done. est shape: {spice_est.shape}")
 
