@@ -24,12 +24,20 @@ build/
 .AppleDouble
 .LSOverride
 
+# Claude Code local state
+.claude/
+
 # Editors
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+
+# Experimental / work-in-progress scripts (kept local only)
+scripts/04b_SPICE_refit.py
+scripts/04c_SPICE_uoss_refit.py
+scripts/04d_SPICE_lam20_refit.py
 
 # HPC submission scripts
 *.sh
