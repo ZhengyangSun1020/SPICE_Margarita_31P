@@ -45,9 +45,7 @@ filterwarnings("ignore")
 
 import mrinufft
 
-_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_workspace = os.path.dirname(_root)
-sys.path.insert(0, _workspace)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from recon_concept_twix_31p import (
     load_concept_twix,
