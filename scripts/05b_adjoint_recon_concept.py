@@ -4,6 +4,19 @@
 
 Usage:
     python 05b_adjoint_recon_concept.py --dat "path/to/meas_*.dat" --out-dir ./output
+    python 05b_adjoint_recon_concept.py --dat "path/to/meas_*.dat" --out-dir ./output --no-dcf
+    python 05b_adjoint_recon_concept.py --dat "path/to/meas_*.dat" --out-dir ./output --no-hamming
+    python 05b_adjoint_recon_concept.py --dat "path/to/meas_*.dat" --out-dir ./output --no-dcf --no-hamming
+
+Options:
+    --dat             Siemens Twix .dat file (required)
+    --out-dir         Output directory (default: ./output)
+    --no-dcf          Disable radial density compensation
+    --no-hamming      Disable Hamming k-space weighting (keeps DCF)
+    --no-phase-corr   Disable temporal interleave phase correction
+    --no-fov-shift    Disable FOV shift correction
+    --ppmlim L H      PPM display range (default: -20 20)
+    --plot-voxel Y X  Plot a specific voxel instead of best-SNR
 
 Pipeline:
     1. Load & rearrange raw Twix data (pymapVBVD)
