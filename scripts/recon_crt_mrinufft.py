@@ -18,8 +18,6 @@ Usage:
 from __future__ import annotations
 import argparse, sys, time
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 try:

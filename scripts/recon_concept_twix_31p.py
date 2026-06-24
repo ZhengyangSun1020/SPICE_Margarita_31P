@@ -22,8 +22,6 @@ import argparse, os, sys, time
 from warnings import filterwarnings
 filterwarnings("ignore")
 
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
