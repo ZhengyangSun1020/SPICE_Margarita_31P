@@ -355,7 +355,7 @@ def main():
 
     # ── 8. Save ─────────────────────────────────────────────────────
     FREQ = np.fft.fftshift(np.fft.fftfreq(n_spec, d=dwell_s))
-    PPM = -FREQ / larmor_mhz + args.ppm_center
+    PPM = FREQ / larmor_mhz + args.ppm_center
 
     np.save(os.path.join(data_dir, "iter_recon_fid.npy"), recon_fid)
     np.save(os.path.join(data_dir, "iter_recon_spec.npy"), recon_spec)

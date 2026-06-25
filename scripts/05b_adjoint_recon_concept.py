@@ -286,6 +286,10 @@ def parse_args():
     p.add_argument("--no-fov-shift", action="store_true")
     p.add_argument("--no-dcf", action="store_true")
     p.add_argument("--no-hamming", action="store_true")
+    p.add_argument("--lb", type=float, default=0.0,
+                   help="Exponential line broadening in Hz (Lorentzian apodization)")
+    p.add_argument("--gf", type=float, default=0.0,
+                   help="Gaussian filter width in Hz (Gaussian apodization)")
     p.add_argument("--ppm-center", type=float, default=0.0)
     p.add_argument("--ppmlim", type=float, nargs=2, default=[-20, 20])
     p.add_argument("--plot-voxel", type=int, nargs=2, default=None)
@@ -366,6 +370,20 @@ def main():
     print(f"[recon] Building finufft operator: {total_kpts} pts -> {Ny}x{Nx}")
     image_fid, image_spec = adjoint_nufft_recon(
         kdata_flat, traj, (Ny, Nx), n_spec, dcf)
+
+    # ── 7b. Apodization / noise filter ─────────────────────────────────
+    if args.lb > 0 or args.gf > 0:
+        t_axis = np.arange(n_spec) * dwell_s
+        apod = np.ones(n_spec, dtype=np.float32)
+        if args.lb > 0:
+            apod *= np.exp(-np.pi * args.lb * t_axis).astype(np.float32)
+            print(f"[recon] Exponential line broadening: {args.lb} Hz")
+        if args.gf > 0:
+            apod *= np.exp(-(np.pi * args.gf * t_axis)**2).astype(np.float32)
+            print(f"[recon] Gaussian filter: {args.gf} Hz")
+        image_fid = image_fid * apod[np.newaxis, np.newaxis, :]
+        image_spec = FIDToSpec(image_fid, axis=-1)
+
     print(f"[recon] image shape={image_spec.shape}  "
           f"|max|={np.abs(image_spec).max():.4e}")
 
@@ -386,7 +404,7 @@ def main():
 
     # ── 9. Figures ─────────────────────────────────────────────────────
     FREQ = np.fft.fftshift(np.fft.fftfreq(n_spec, d=dwell_s))
-    PPM = -FREQ / larmor_mhz + args.ppm_center
+    PPM = FREQ / larmor_mhz + args.ppm_center
 
     plot_magnitude_map(image_spec, fig_dir)
     plot_best_snr_spectrum(image_spec, PPM, args.ppmlim, fig_dir)

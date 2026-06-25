@@ -155,6 +155,32 @@ P31_METABOLITES = {
 }
 
 
+def load_localizer(dcm_dir, target_shape):
+    """Load DICOM localizer and downsample to target spatial grid."""
+    import pydicom
+    from scipy.ndimage import zoom
+
+    dcm_files = sorted([os.path.join(dcm_dir, f) for f in os.listdir(dcm_dir)
+                        if f.endswith('.dcm')])
+    slices = []
+    for f in dcm_files:
+        ds = pydicom.dcmread(f)
+        slices.append(ds.pixel_array.astype(np.float32))
+
+    vol = np.stack(slices, axis=-1)
+    mid_slice = vol[:, :, vol.shape[2] // 2]
+
+    Ny, Nx = target_shape
+    zoom_y = Ny / mid_slice.shape[0]
+    zoom_x = Nx / mid_slice.shape[1]
+    downsampled = zoom(mid_slice, (zoom_y, zoom_x), order=1)
+
+    norm = (downsampled - downsampled.min()) / (downsampled.max() - downsampled.min() + 1e-12)
+    print(f"[spice] Loaded localizer: {mid_slice.shape} -> {norm.shape}, "
+          f"{len(dcm_files)} slices (used middle)")
+    return norm
+
+
 def load_csi_prior(dcm_path, crt_n_spec, crt_dwell_s):
     """Load 8x8 CSI DICOM and resample FIDs to the CRT time grid."""
     import pydicom
@@ -201,9 +227,9 @@ def generate_training_data(n_spec, dwell_s, larmor_mhz, n_training=5000):
             cm = rng.uniform(*props["amp_range"])
             lw = rng.uniform(*props["lw_range"])
             freq_hz = props["shift_ppm"] * larmor_mhz
-            sig += cm * np.exp(-lw * np.pi * time_axis) * np.exp(-2j * np.pi * freq_hz * time_axis)
+            sig += cm * np.exp(-lw * np.pi * time_axis) * np.exp(+2j * np.pi * freq_hz * time_axis)
         whole_shift = rng.uniform(-0.05, 0.05) * larmor_mhz
-        sig *= np.exp(-2j * np.pi * whole_shift * time_axis)
+        sig *= np.exp(+2j * np.pi * whole_shift * time_axis)
         training[i] = sig.astype(np.complex64)
     return training
 
@@ -355,6 +381,8 @@ def parse_args():
                    help="Reference .dat file for subspace (--subspace-src basis-dat)")
     p.add_argument("--csi-prior", default=None,
                    help="Path to CSI DICOM (required when --subspace-src csi)")
+    p.add_argument("--localizer", default=None,
+                   help="Path to DICOM localizer dir for spatial prior")
     p.add_argument("--wmax", type=float, default=5e3, help="Max edge weight for spatial prior")
     p.add_argument("--ppm-center", type=float, default=0.0)
     p.add_argument("--ppmlim", type=float, nargs=2, default=[-20, 20])
@@ -413,7 +441,7 @@ def main():
         n_coils=1, density=dcf if dcf is not None else False)
 
     FREQ = np.fft.fftshift(np.fft.fftfreq(n_spec, d=dwell_s))
-    PPM = -FREQ / larmor_mhz + args.ppm_center
+    PPM = FREQ / larmor_mhz + args.ppm_center
 
     # ── 7. Full adjoint recon (needed for subspace & spatial prior) ──
     print("[spice] Computing full adjoint reconstruction ...")
@@ -482,7 +510,12 @@ def main():
     fig.savefig(os.path.join(fig_dir, "spice_subspace.png"), dpi=120)
     plt.close(fig)
 
-    WW, B = calc_Bmatrix_simple(mag_norm, wmax=args.wmax, adj=8)
+    if args.localizer:
+        spatial_prior = load_localizer(args.localizer, (N, N))
+        print(f"[spice] Using localizer as spatial prior")
+    else:
+        spatial_prior = mag_norm
+    WW, B = calc_Bmatrix_simple(spatial_prior, wmax=args.wmax, adj=8)
     adj_spec = FIDToSpec(adj_fid_img, axis=-1)
 
     # ── 9. SPICE reconstruction (loop over ranks) ───────────────────
