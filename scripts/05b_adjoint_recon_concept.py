@@ -386,7 +386,7 @@ def main():
 
     # ── 9. Figures ─────────────────────────────────────────────────────
     FREQ = np.fft.fftshift(np.fft.fftfreq(n_spec, d=dwell_s))
-    PPM = FREQ / larmor_mhz + args.ppm_center
+    PPM = -FREQ / larmor_mhz + args.ppm_center
 
     plot_magnitude_map(image_spec, fig_dir)
     plot_best_snr_spectrum(image_spec, PPM, args.ppmlim, fig_dir)
