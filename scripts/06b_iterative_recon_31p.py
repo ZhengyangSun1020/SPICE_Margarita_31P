@@ -104,93 +104,138 @@ def compute_fov_shift(info):
     return base_pos[0] / vox_size, base_pos[1] / vox_size
 
 
-def compute_dcf(kx_cpp, ky_cpp, kx_raw, ky_raw, use_hamming=True):
-    r_per_pt = np.sqrt(kx_cpp**2 + ky_cpp**2)
-    weights = np.maximum(r_per_pt / (r_per_pt.max() + 1e-12), 0.01)
-    if use_hamming:
-        kx_norm = np.pi * kx_raw / (np.abs(kx_raw).max() + 1e-30)
-        ky_norm = np.pi * ky_raw / (np.abs(ky_raw).max() + 1e-30)
-        r_norm = np.sqrt(kx_norm**2 + ky_norm**2)
-        weights = weights * (0.54 + 0.46 * np.cos(r_norm))
-    return weights.astype(np.float32)
+# ── wSVD coil combination ───────────────────────────────────────────────
+
+def wsvd_combine(fid_mc, noise_cov=None):
+    """Per-voxel weighted SVD coil combination in frequency domain.
+
+    Parameters
+    ----------
+    fid_mc    : (n_spec, n_ch, Nx, Ny[, Nz])  per-coil FID images (complex128)
+    noise_cov : (n_ch, n_ch) noise covariance matrix, or None
+
+    Returns
+    -------
+    combined_fid : (n_spec, Nx, Ny[, Nz])
+    quality      : (Nx, Ny[, Nz])
+    """
+    n_spec, n_ch = fid_mc.shape[:2]
+    spatial_shape = fid_mc.shape[2:]
+    n_vox = int(np.prod(spatial_shape))
+
+    spec_mc   = np.fft.fftshift(np.fft.fft(fid_mc, axis=0), axes=0)
+    spec_flat = spec_mc.reshape(n_spec, n_ch, n_vox)
+
+    if noise_cov is None or n_ch == 1:
+        scale_mat     = np.eye(n_ch, dtype=np.complex128) * np.sqrt(0.5)
+        inv_scale_mat = np.eye(n_ch, dtype=np.complex128) / np.sqrt(0.5)
+    else:
+        noiseCov = np.asarray(noise_cov, dtype=np.complex128)
+        noiseVal, noiseVec = np.linalg.eigh(noiseCov)
+        noiseVal      = np.maximum(np.real(noiseVal), 1e-30)
+        scale_mat     = noiseVec @ np.diag(np.sqrt(0.5) / np.sqrt(noiseVal))
+        inv_scale_mat = np.linalg.inv(scale_mat)
+
+    combined_fd = np.zeros((n_spec, n_vox), dtype=np.complex128)
+    quality     = np.zeros(n_vox)
+    sqrt_nch    = np.sqrt(n_ch)
+
+    for i in range(n_vox):
+        raw    = spec_flat[:, :, i]
+        scaled = raw @ scale_mat
+        u, s, vh = np.linalg.svd(scaled, full_matrices=False)
+        s_norm     = np.linalg.norm(s) + 1e-30
+        quality[i] = float((s[0] / s_norm * sqrt_nch - 1) / (sqrt_nch - 1 + 1e-30))
+        v1 = vh[0, :].conj()
+        svdCoilAmplitudes = v1 @ inv_scale_mat
+        ref        = svdCoilAmplitudes[0]
+        svdRescale = np.linalg.norm(svdCoilAmplitudes) * ref / (abs(ref) + 1e-30)
+        combined_fd[:, i] = u[:, 0] * s[0] * svdRescale
+
+    combined_fd  = combined_fd.reshape((n_spec,) + spatial_shape)
+    quality      = quality.reshape(spatial_shape)
+    combined_fid = np.fft.ifft(np.fft.ifftshift(combined_fd, axes=0), axis=0)
+    return combined_fid, quality
 
 
 # ── Iterative reconstruction ────────────────────────────────────────────
 
-def iterative_recon_2d(kdata_flat, nufft_op, N, n_spec, maxiter=30,
-                       lam=0.0, solver="cg", rtol=1e-3):
-    """
-    Iterative CG reconstruction for 2D CRT MRSI.
+def iterative_recon_2d(kdata_mc, nufft_op, N, n_spec, n_ch=1,
+                        noise_cov=None, maxiter=30, lam=0.0, solver="cg", rtol=1e-3):
+    """Iterative CG reconstruction for 2D CRT MRSI.
 
-    Since the 2D Gram F^H F is the same for all spectral points,
-    precompute it once and solve all spectral points in one CG call
-    on the full (N_Vox * n_spec) vector.
+    For multi-coil (n_ch > 1): Gram is computed once, each coil solved with
+    the same Gram and its own RHS, then wSVD combines the per-coil images.
+    For n_ch=1: single-coil path with direct or CG solve.
 
-    Parameters
-    ----------
-    kdata_flat : (n_kpts, n_spec) k-space data
-    nufft_op   : mrinufft 2D NUFFT operator (with DCF)
-    N          : matrix size (NxN grid)
-    n_spec     : number of spectral points
-    maxiter    : CG iterations
-    lam        : Tikhonov regularization (0 = none)
+    kdata_mc : (n_kpts, n_spec, n_ch)
+    Returns (recon_fid, adj_fid) each (N, N, n_spec).
     """
-    N_Vox = N * N
+    N_Vox  = N * N
     D_TYPE = np.complex64
+    G_TYPE = np.complex128  # λ_min ≈ 9e-7 → must use float64
 
-    # ── Precompute Gram matrix ──────────────────────────────────────
-    print("[iter] Precomputing Gram matrix ...")
-    Gram = np.zeros((N_Vox, N_Vox), dtype=D_TYPE)
+    # Precompute Gram matrix once (same for all coils and spectral points)
+    print("[iter] Precomputing Gram matrix (float64) ...")
+    Gram = np.zeros((N_Vox, N_Vox), dtype=G_TYPE)
     for v in tqdm(range(N_Vox), desc="Gram columns"):
         delta = np.zeros((N, N), dtype=D_TYPE)
         delta.flat[v] = 1.0
         Gram[:, v] = nufft_op.adj_op(nufft_op.op(delta)).reshape(N_Vox)
 
     if lam > 0:
-        Gram += lam * np.eye(N_Vox, dtype=D_TYPE)
+        lam_max = np.real(np.linalg.eigvalsh(Gram)).max()
+        lam_eff = lam * lam_max
+        print(f"[iter] lam_max(Gram)={lam_max:.4g}, lam_rel={lam:.4g} -> lam_eff={lam_eff:.4g}")
+        Gram += lam_eff * np.eye(N_Vox, dtype=G_TYPE)
 
-    # ── RHS: F^H y for each spectral point ──────────────────────────
-    print("[iter] Computing adjoint (F^H y) ...")
-    b = np.zeros((N_Vox, n_spec), dtype=D_TYPE)
-    for t in tqdm(range(n_spec), desc="Adjoint", miniters=100):
-        b[:, t] = nufft_op.adj_op(kdata_flat[:, t]).reshape(N_Vox)
+    total_size = N_Vox * n_spec
 
-    # ── Solve ───────────────────────────────────────────────────────
-    # Gram is (N_Vox, N_Vox), same for all spectral points.
-    # Solve Gram @ X = B where X, B are (N_Vox, n_spec).
-    #
-    # For small grids: direct solve is fast.
-    # For iterative: CG on the full (N_Vox * n_spec) vector,
-    # where the matvec applies Gram to each spectral column.
+    def mv(x_vec):
+        return (Gram @ x_vec.reshape(N_Vox, n_spec)).ravel()
 
-    if maxiter == 0:
-        print(f"[iter] Direct solve ({N_Vox}x{N_Vox}, {n_spec} spectral pts) ...")
-        X = np.linalg.solve(Gram, b)
-    else:
-        print(f"[iter] CG solve ({maxiter} iters, lam={lam}) ...")
-        total_size = N_Vox * n_spec
+    A_op = LinearOperator((total_size, total_size), matvec=mv, dtype=G_TYPE)
 
-        def mv(x_vec):
-            X = x_vec.reshape(N_Vox, n_spec)
-            return (Gram @ X).ravel().astype(D_TYPE)
+    # Per-coil images: (n_spec, n_ch, N, N)
+    X_mc   = np.zeros((n_spec, n_ch, N, N), dtype=G_TYPE)
+    adj_mc = np.zeros((n_spec, n_ch, N, N), dtype=G_TYPE)
 
-        A_op = LinearOperator((total_size, total_size), matvec=mv, dtype=D_TYPE)
+    for ch in range(n_ch):
+        label = f"Coil {ch+1}/{n_ch}" if n_ch > 1 else "Single coil"
+        print(f"[iter] {label} — adjoint + solve ...")
+        kdata_ch = kdata_mc[:, :, ch]   # (n_kpts, n_spec)
 
-        x0 = b.ravel().astype(D_TYPE)
-        b_flat = b.ravel().astype(D_TYPE)
+        b_ch = np.zeros((N_Vox, n_spec), dtype=G_TYPE)
+        for t in tqdm(range(n_spec), desc="Adjoint", miniters=100):
+            b_ch[:, t] = nufft_op.adj_op(kdata_ch[:, t]).reshape(N_Vox)
 
-        pbar = tqdm(total=maxiter, desc="CG iters")
-        def _cb(xk):
-            pbar.update(1)
+        adj_mc[:, ch] = b_ch.T.reshape(n_spec, N, N)
 
-        x_flat, info = cg(A_op, b_flat, x0=x0, maxiter=maxiter, rtol=rtol, callback=_cb)
-        pbar.close()
-        X = x_flat.reshape(N_Vox, n_spec)
-        print(f"[iter] CG info={info}")
+        if maxiter == 0:
+            X_ch = np.linalg.solve(Gram, b_ch)       # (N_Vox, n_spec)
+        else:
+            pbar = tqdm(total=maxiter, desc=f"CG ch{ch}", leave=(n_ch == 1))
+            def _cb(xk): pbar.update(1)
+            x_flat, info_code = cg(A_op, b_ch.ravel(),
+                                   x0=np.zeros(total_size, dtype=G_TYPE),
+                                   maxiter=maxiter, rtol=rtol, callback=_cb)
+            pbar.close()
+            print(f"[iter]   CG info={info_code}")
+            X_ch = x_flat.reshape(N_Vox, n_spec)
 
-    recon_fid = X.reshape(N, N, n_spec)
-    adj_fid = b.reshape(N, N, n_spec)
-    return recon_fid, adj_fid
+        X_mc[:, ch] = X_ch.T.reshape(n_spec, N, N)
+
+    # wSVD combination: (n_spec, n_ch, N, N) → (n_spec, N, N)
+    print("[iter] Applying wSVD coil combination ...")
+    recon_fid, quality = wsvd_combine(X_mc,   noise_cov=noise_cov)
+    adj_fid,   _       = wsvd_combine(adj_mc, noise_cov=noise_cov)
+
+    if n_ch > 1:
+        print(f"[iter] wSVD quality  mean={float(np.mean(quality)):.3f}")
+
+    # (n_spec, N, N) → (N, N, n_spec)
+    return (recon_fid.transpose(1, 2, 0).astype(D_TYPE),
+            adj_fid.transpose(1, 2, 0).astype(D_TYPE))
 
 
 # ── Plotting ────────────────────────────────────────────────────────────
@@ -275,8 +320,6 @@ def parse_args():
     p.add_argument("--out-dir", default="./output")
     p.add_argument("--no-phase-corr", action="store_true")
     p.add_argument("--no-fov-shift", action="store_true")
-    p.add_argument("--no-dcf", action="store_true")
-    p.add_argument("--no-hamming", action="store_true")
     p.add_argument("--maxiter", type=int, default=150,
                    help="CG iterations (0 = direct solve)")
     p.add_argument("--lam", type=float, default=0.0,
@@ -319,32 +362,25 @@ def main():
         gamma_mhz_per_mt, info["fov_m"], N)
     traj = np.stack([kx_cpp, ky_cpp], axis=-1).astype(np.float32)
 
-    # ── 4. FOV shift ────────────────────────────────────────────────
-    kdata_flat = kdata[:, :, 0, :].transpose(2, 0, 1).reshape(-1, n_spec)
+    # ── 4. Flatten kdata: (n_kpts, n_spec, n_ch) ────────────────────
+    n_ch = kdata.shape[2]
+    kdata_flat_mc = kdata.transpose(3, 0, 1, 2).reshape(-1, n_spec, n_ch)
     if not args.no_fov_shift:
         d1, d2 = compute_fov_shift(info)
         shift_phase = np.exp(-2j * np.pi * (kx_cpp * d1 + ky_cpp * d2))
-        kdata_flat = kdata_flat * shift_phase[:, np.newaxis]
+        kdata_flat_mc = kdata_flat_mc * shift_phase[:, np.newaxis, np.newaxis]
         print(f"[iter] FOV shift: {d1:.4f}, {d2:.4f} vox")
+    print(f"[iter] kdata_flat_mc: {kdata_flat_mc.shape}  (n_kpts, n_spec, n_ch={n_ch})")
 
-    # ── 5. DCF ──────────────────────────────────────────────────────
-    dcf = None
-    if not args.no_dcf:
-        dcf = compute_dcf(kx_cpp, ky_cpp, kx_raw, ky_raw,
-                          use_hamming=not args.no_hamming)
-        print("[iter] DCF + Hamming applied")
-
-    # ── 6. NUFFT operator ───────────────────────────────────────────
-    # Like 06 (1H): iterative solver uses pure F^H F (no DCF).
-    # DCF is only used for the adjoint (05b) as a quick approximation.
+    # ── 5. NUFFT operator ───────────────────────────────────────────
     nufft_op = mrinufft.get_operator(
         "finufft", samples=traj, shape=(N, N),
         n_coils=1, density=False)
 
-    # ── 7. Iterative reconstruction ─────────────────────────────────
+    # ── 6. Per-coil iterative reconstruction + wSVD ─────────────────
     t0 = time.time()
     recon_fid, adj_fid = iterative_recon_2d(
-        kdata_flat, nufft_op, N, n_spec,
+        kdata_flat_mc, nufft_op, N, n_spec, n_ch=n_ch,
         maxiter=args.maxiter, lam=args.lam,
         solver=args.solver, rtol=args.rtol)
     elapsed = time.time() - t0

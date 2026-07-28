@@ -34,8 +34,17 @@ from tqdm import tqdm
 from warnings import filterwarnings
 filterwarnings("ignore")
 
+import importlib.util as _ilu, pathlib as _pl
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from recon_concept_twix_31p import load_concept_twix, concept_phase_correction
+from recon_concept_twix_31p import concept_phase_correction
+
+# Import loader and trajectory builder from 06c (correct multi-ADC handling)
+_spec = _ilu.spec_from_file_location(
+    "_06c", _pl.Path(__file__).parent / "06c_iterative_recon_31p_3d.py")
+_06c = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_06c)
+load_concept_twix_3d = _06c.load_concept_twix_3d
 
 
 # ── FFT helpers (replacing fsl_mrs) ─────────────────────────────────────
@@ -44,9 +53,10 @@ def FIDToSpec(x, axis=-1):
     return np.fft.fftshift(np.fft.fft(x, axis=axis), axes=axis)
 
 
-# ── Trajectory & FOV (from 05b) ─────────────────────────────────────────
+# ── Trajectory & DCF ─────────────────────────────────────────────────────
 
-def build_trajectory(first_circ, n_rings, traj_pts, gamma_mhz_per_mt, fov_m, N):
+def build_trajectory_2d(first_circ, n_rings, traj_pts):
+    """Build 2D CRT trajectory max-normalized to [-0.5, 0.5] (mri-nufft convention)."""
     radii = np.sqrt(first_circ[0]**2 + first_circ[1]**2)
     phi0 = np.arctan2(first_circ[1], first_circ[0])
     all_kx, all_ky = [], []
@@ -56,9 +66,39 @@ def build_trajectory(first_circ, n_rings, traj_pts, gamma_mhz_per_mt, fov_m, N):
         all_ky.append(radii[r] * np.sin(angles))
     kx_raw = np.concatenate(all_kx)
     ky_raw = np.concatenate(all_ky)
-    kx_cpp = kx_raw * gamma_mhz_per_mt * (fov_m / N)
-    ky_cpp = ky_raw * gamma_mhz_per_mt * (fov_m / N)
-    return kx_raw, ky_raw, kx_cpp, ky_cpp
+    max_radius = np.sqrt(kx_raw**2 + ky_raw**2).max()
+    kx = kx_raw * 0.5 / max_radius
+    ky = ky_raw * 0.5 / max_radius
+    return np.stack([kx, ky], axis=-1).astype(np.float32)
+
+
+def compute_crt_dcf_hamming(traj):
+    """CRT Hamming DCF matching MATLAB op_CalcAndApplyDensComp.m."""
+    r = np.sqrt(traj[:, 0]**2 + traj[:, 1]**2)
+    unique_r = np.unique(np.round(r, 6))
+    n_rings = len(unique_r)
+    r_norm = unique_r / unique_r.max()
+    N_per_ring = np.array([int((np.abs(r - ri) < 1e-5).sum()) for ri in unique_r])
+    max_pts = int(N_per_ring.max())
+    dcf_ring = np.zeros(n_rings)
+    for i in range(n_rings):
+        if i == 0:
+            r_out = (r_norm[0] + r_norm[1]) / 2.0
+            area = np.pi * r_out**2
+        elif i == n_rings - 1:
+            r_in = (r_norm[-2] + r_norm[-1]) / 2.0
+            r_out = 1.5 * r_norm[-1] - 0.5 * r_norm[-2]
+            area = np.pi * (r_out**2 - r_in**2)
+        else:
+            r_in = (r_norm[i - 1] + r_norm[i]) / 2.0
+            r_out = (r_norm[i] + r_norm[i + 1]) / 2.0
+            area = np.pi * (r_out**2 - r_in**2)
+        dcf_ring[i] = area * (max_pts / N_per_ring[i])
+    dcf = np.zeros(len(r), dtype=np.float32)
+    for i, ri in enumerate(unique_r):
+        dcf[np.abs(r - ri) < 1e-5] = dcf_ring[i]
+    dcf *= (0.54 + 0.46 * np.cos(2.0 * np.pi * r)).astype(np.float32)
+    return dcf
 
 
 def _fGSLClassOri(dGs):
@@ -96,24 +136,15 @@ def _fGSLCalcPRS(dGs, dPhi):
 
 
 def compute_fov_shift(info):
+    """Return (d_pe, d_ro) in voxels for 2D FOV shift correction."""
     pos = np.array([info["pos_sag"], info["pos_cor"], info["pos_tra"]])
     snv = np.array([info["snv_x"], info["snv_y"], info["snv_z"]])
+    snv = snv / (np.linalg.norm(snv) + 1e-30)
     phase_vec, read_vec = _fGSLCalcPRS(snv, info["in_plane_rotation"])
     rot_mat = np.column_stack([phase_vec, read_vec, snv])
     base_pos = rot_mat.T @ pos
     vox_size = info["fov_mm"] / info["matrix_size"]
-    return base_pos[0] / vox_size, base_pos[1] / vox_size
-
-
-def compute_dcf(kx_cpp, ky_cpp, kx_raw, ky_raw, use_hamming=True):
-    r_per_pt = np.sqrt(kx_cpp**2 + ky_cpp**2)
-    weights = np.maximum(r_per_pt / (r_per_pt.max() + 1e-12), 0.01)
-    if use_hamming:
-        kx_norm = np.pi * kx_raw / (np.abs(kx_raw).max() + 1e-30)
-        ky_norm = np.pi * ky_raw / (np.abs(ky_raw).max() + 1e-30)
-        r_norm = np.sqrt(kx_norm**2 + ky_norm**2)
-        weights = weights * (0.54 + 0.46 * np.cos(r_norm))
-    return weights.astype(np.float32)
+    return base_pos[0] / vox_size, base_pos[1] / vox_size   # (d_pe, d_ro)
 
 
 # ── Spatial regularization (from utils/graph.py) ────────────────────────
@@ -145,13 +176,13 @@ def calc_Bmatrix_simple(ref_img, wmax=5e3, adj=8):
 # 31P skeletal muscle metabolites at 3T (literature values)
 # Refs: Valkovic MRM 2014, Meyerspeer NMR Biomed 2020, Krssak NMR Biomed 2004
 P31_METABOLITES = {
-    "PCr":  {"shift_ppm": 0.0,    "lw_range": (5, 12),  "amp_range": (3.5, 4.5)},
-    "Pi":   {"shift_ppm": 4.9,    "lw_range": (6, 18),  "amp_range": (0.3, 0.7)},
-    "gATP": {"shift_ppm": -2.48,  "lw_range": (12, 30), "amp_range": (0.8, 1.2)},
-    "aATP": {"shift_ppm": -7.52,  "lw_range": (12, 30), "amp_range": (0.8, 1.2)},
-    "bATP": {"shift_ppm": -16.26, "lw_range": (15, 35), "amp_range": (0.8, 1.2)},
-    "PDE":  {"shift_ppm": 2.8,    "lw_range": (10, 25), "amp_range": (0.3, 1.0)},
-    "PME":  {"shift_ppm": 6.3,    "lw_range": (10, 25), "amp_range": (0.0, 0.3)},
+    "PCr":  {"shift_ppm":  0.0,    "lw_range": (5, 15),  "amp_range": (3.5, 4.5)},
+    "Pi":   {"shift_ppm":  4.85,   "lw_range": (5, 20),  "amp_range": (0.0, 0.8)},
+    "Pi2":  {"shift_ppm":  4.25,   "lw_range": (5, 20),  "amp_range": (0.0, 0.5)},
+    "PDE":  {"shift_ppm":  3.07,   "lw_range": (10, 35), "amp_range": (0.0, 0.3)},
+    "gATP": {"shift_ppm": -2.53,   "lw_range": (10, 30), "amp_range": (0.8, 1.2)},
+    "aATP": {"shift_ppm": -7.58,   "lw_range": (10, 30), "amp_range": (0.8, 1.2)},
+    "bATP": {"shift_ppm": -15.86,  "lw_range": (12, 35), "amp_range": (0.8, 1.2)},
 }
 
 
@@ -312,21 +343,20 @@ def plot_results(adj_spec, spice_spec, PPM, ppmlim, fig_dir):
     fig.savefig(os.path.join(fig_dir, "spice_spectrum_best_snr.png"), dpi=150)
     plt.close(fig)
 
-    # ── All spectra grid ────────────────────────────────────────────
-    fig, axes = plt.subplots(Ny, Nx, figsize=(Nx*2.5, Ny*2), sharex=True, sharey=True)
-    if Ny == 1: axes = axes[np.newaxis, :]
-    if Nx == 1: axes = axes[:, np.newaxis]
-    for y in range(Ny):
-        for x in range(Nx):
-            ax = axes[Ny-1-y, x]
-            sp = np.abs(spice_spec[y, x, :])
-            ax.plot(PPM, sp, 'k-', lw=0.4)
-            ax.fill_between(PPM, 0, sp, alpha=0.08, color='blue')
-            ax.set_xlim(ppmlim[1], ppmlim[0])
-            ax.set_title(f"[{y},{x}]", fontsize=7, pad=1)
-            ax.tick_params(labelsize=4)
+    # ── All spectra grid — per-voxel normalised, axis off ──────────
+    fig, axes = plt.subplots(Nx, Ny, figsize=(Ny * 2.5, Nx * 2))
+    axes = np.array(axes).reshape(Nx, Ny)
+    for yi in range(Ny):
+        for xi in range(Nx):
+            ax = axes[Nx - 1 - xi, yi]
+            sp_v = np.nan_to_num(np.abs(spice_spec[xi, yi, :]))
+            sp_v = sp_v / (sp_v.max() + 1e-20)
+            ax.plot(sp_v, 'k', lw=0.4)
+            ax.set_xlim(0, len(sp_v) - 1)
+            ax.set_ylim(0, 1.05)
+            ax.axis("off")
     fig.suptitle("SPICE — All voxel spectra", fontsize=11)
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.tight_layout()
     fig.savefig(os.path.join(fig_dir, "spice_all_spectra.png"), dpi=150)
     plt.close(fig)
 
@@ -339,8 +369,8 @@ def parse_args():
     p.add_argument("--out-dir", default="./output")
     p.add_argument("--no-phase-corr", action="store_true")
     p.add_argument("--no-fov-shift", action="store_true")
-    p.add_argument("--no-dcf", action="store_true")
-    p.add_argument("--no-hamming", action="store_true")
+    p.add_argument("--apodization", type=float, default=0.0,
+                   help="Gaussian apodization FWHM in Hz (0 = none, e.g. 20)")
     p.add_argument("--rank", type=int, nargs="+", default=[15],
                    help="SPICE subspace rank(s) — pass multiple to compare")
     p.add_argument("--lambda1", type=float, default=0.0, help="Spatial regularization weight")
@@ -370,47 +400,42 @@ def main():
         os.makedirs(d, exist_ok=True)
 
     # ── 1. Load raw data ────────────────────────────────────────────
-    info = load_concept_twix(args.dat)
-    kdata = info["kdata"]
-    N = info["matrix_size"]
-    n_spec = info["n_spec"]
+    info = load_concept_twix_3d(args.dat)
+    kdata   = info["kdata"]          # (pts_per_ring, n_spec, 1, n_rings)
+    N       = info["matrix_size"]
+    n_spec  = info["n_spec"]
     n_rings = info["n_rings"]
-    traj_pts = int(info["traj_pts"][0])
-    dwell_s = info["dwell_s"] * 2
-    larmor_mhz = info["larmor_freq_mhz"]
+    traj_pts = int(info["traj_pts"].max())
+    dwell_s  = info["dwell_s"] * 2   # spectral dwell (ADC dwell × 2 after OS removal)
+    larmor_mhz       = info["larmor_freq_mhz"]
     gamma_mhz_per_mt = info["gamma_2pi"] / 1e9
 
-    print(f"\n[spice] Matrix={N}x{N}, vecSize={n_spec}, rings={n_rings}")
+    print(f"\n[spice] Matrix={N}x{N}, vecSize={n_spec}, rings={n_rings}, coils={kdata.shape[2]}")
 
     # ── 2. Phase correction ─────────────────────────────────────────
     if not args.no_phase_corr:
         kdata = concept_phase_correction(kdata, info["_ti_per_ring"])
 
-    # ── 3. Trajectory ───────────────────────────────────────────────
-    kx_raw, ky_raw, kx_cpp, ky_cpp = build_trajectory(
-        info["first_circle"], n_rings, traj_pts,
-        gamma_mhz_per_mt, info["fov_m"], N)
-    traj = np.stack([kx_cpp, ky_cpp], axis=-1).astype(np.float32)
+    # ── 3. Trajectory (max-normalised to [-0.5, 0.5]) ───────────────
+    traj = build_trajectory_2d(info["first_circle"], n_rings, traj_pts)
+    print(f"[spice] traj: {len(traj)} k-pts  kx=[{traj[:,0].min():.3f},{traj[:,0].max():.3f}]")
 
     # ── 4. FOV shift ────────────────────────────────────────────────
     kdata_flat = kdata[:, :, 0, :].transpose(2, 0, 1).reshape(-1, n_spec)
     if not args.no_fov_shift:
-        d1, d2 = compute_fov_shift(info)
-        shift_phase = np.exp(-2j * np.pi * (kx_cpp * d1 + ky_cpp * d2))
+        d_pe, d_ro = compute_fov_shift(info)
+        shift_phase = np.exp(-2j * np.pi * (traj[:, 0] * d_pe + traj[:, 1] * d_ro))
         kdata_flat = kdata_flat * shift_phase[:, np.newaxis]
-        print(f"[spice] FOV shift: {d1:.4f}, {d2:.4f} vox")
+        print(f"[spice] FOV shift: pe={d_pe:.4f}, ro={d_ro:.4f} vox")
 
-    # ── 5. DCF ──────────────────────────────────────────────────────
-    dcf = None
-    if not args.no_dcf:
-        dcf = compute_dcf(kx_cpp, ky_cpp, kx_raw, ky_raw,
-                          use_hamming=not args.no_hamming)
-        print(f"[spice] DCF + Hamming applied")
+    # ── 5. DCF (Hamming CRT, matches op_CalcAndApplyDensComp.m) ────
+    dcf = compute_crt_dcf_hamming(traj)
+    print(f"[spice] DCF weights: min={dcf.min():.4f}  max={dcf.max():.4f}")
 
     # ── 6. NUFFT operator ───────────────────────────────────────────
     nufft_op = mrinufft.get_operator(
         "finufft", samples=traj, shape=(N, N),
-        n_coils=1, density=dcf if dcf is not None else False)
+        n_coils=1, density=dcf)
 
     FREQ = np.fft.fftshift(np.fft.fftfreq(n_spec, d=dwell_s))
     PPM = -FREQ / larmor_mhz + args.ppm_center
@@ -429,28 +454,24 @@ def main():
         if not args.basis_dat:
             sys.exit("--basis-dat path required when --subspace-src basis-dat")
         print(f"[spice] Loading reference .dat for subspace: {args.basis_dat}")
-        ref_info = load_concept_twix(args.basis_dat)
+        ref_info = load_concept_twix_3d(args.basis_dat)
         ref_kdata = ref_info["kdata"]
         if not args.no_phase_corr:
             ref_kdata = concept_phase_correction(ref_kdata, ref_info["_ti_per_ring"])
         ref_N = ref_info["matrix_size"]
         ref_n_spec = ref_info["n_spec"]
-        ref_traj_pts = int(ref_info["traj_pts"][0])
-        ref_gamma = ref_info["gamma_2pi"] / 1e9
-        _, _, ref_kx, ref_ky = build_trajectory(
-            ref_info["first_circle"], ref_info["n_rings"], ref_traj_pts,
-            ref_gamma, ref_info["fov_m"], ref_N)
-        ref_traj = np.stack([ref_kx, ref_ky], axis=-1).astype(np.float32)
-        ref_dcf = compute_dcf(ref_kx, ref_ky,
-            *build_trajectory(ref_info["first_circle"], ref_info["n_rings"],
-                              ref_traj_pts, ref_gamma, ref_info["fov_m"], ref_N)[:2])
+        ref_traj_pts = int(ref_info["traj_pts"].max())
+        ref_traj = build_trajectory_2d(
+            ref_info["first_circle"], ref_info["n_rings"], ref_traj_pts)
+        ref_dcf = compute_crt_dcf_hamming(ref_traj)
         ref_nufft = mrinufft.get_operator(
             "finufft", samples=ref_traj, shape=(ref_N, ref_N),
             n_coils=1, density=ref_dcf)
         ref_flat = ref_kdata[:, :, 0, :].transpose(2, 0, 1).reshape(-1, ref_n_spec)
         if not args.no_fov_shift:
-            rd1, rd2 = compute_fov_shift(ref_info)
-            ref_flat = ref_flat * np.exp(-2j * np.pi * (ref_kx * rd1 + ref_ky * rd2))[:, np.newaxis]
+            rd_pe, rd_ro = compute_fov_shift(ref_info)
+            ref_flat = ref_flat * np.exp(
+                -2j * np.pi * (ref_traj[:, 0] * rd_pe + ref_traj[:, 1] * rd_ro))[:, np.newaxis]
         print("[spice] Computing adjoint of reference data ...")
         ref_adj = np.zeros((ref_N * ref_N, ref_n_spec), dtype=np.complex64)
         for t in tqdm(range(ref_n_spec), desc="Ref adjoint", miniters=100):
@@ -474,7 +495,7 @@ def main():
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
     ax1.semilogy(s_vals[:min(30, len(s_vals))], "x-"); ax1.set_title("Singular values")
     for k in range(min(6, max_rank)):
-        ax2.plot(PPM, np.abs(FIDToSpec(Vh[k, :])), label=f"V{k}")
+        ax2.plot(PPM, np.abs(FIDToSpec(Vh[k, :].conj())), label=f"V{k}")
     ax2.set_xlim(20, -20); ax2.set_xlabel("ppm")
     ax2.set_title("Top subspace vectors (spectrum domain)")
     ax2.legend(fontsize=7)
@@ -483,7 +504,7 @@ def main():
     plt.close(fig)
 
     WW, B = calc_Bmatrix_simple(mag_norm, wmax=args.wmax, adj=8)
-    adj_spec = FIDToSpec(adj_fid_img, axis=-1)
+    adj_spec = FIDToSpec(adj_fid_img.conj(), axis=-1)
 
     # ── 9. SPICE reconstruction (loop over ranks) ───────────────────
     for rank in args.rank:
@@ -497,7 +518,15 @@ def main():
             rank=rank, lamda=args.lambda1, n_iter=args.n_iter)
         print(f"[spice] Done in {time.time()-t0:.1f}s")
 
-        spice_spec = FIDToSpec(spice_fid, axis=-1)
+        # Gaussian apodization: exp(-π²·lb²·t²/(4·ln2)), lb=FWHM in Hz
+        if args.apodization > 0:
+            t_apo = np.arange(n_spec) * dwell_s
+            apo = np.exp(-np.pi**2 * args.apodization**2 * t_apo**2 / (4 * np.log(2)))
+            spice_fid = spice_fid * apo
+            print(f"[spice] Applied {args.apodization:.0f} Hz Gaussian apodization")
+
+        # Conjugate FID before FFT to match scanner sign convention
+        spice_spec = FIDToSpec(spice_fid.conj(), axis=-1)
 
         tag = f"rank{rank}"
         np.save(os.path.join(data_dir, f"spice_fid_{tag}.npy"), spice_fid)

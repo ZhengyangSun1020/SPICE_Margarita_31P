@@ -25,6 +25,9 @@ Usage:
     python scripts/06_iterative_nufft_recon.py \\
         --data-dir ./data/ \\
         [--out-dir ./output] [--maxiter 150] [--solver cg]
+
+        
+    python scripts/06_iterative_nufft_recon.py --data-dir ./data/ --out-dir ./output --backend finufft --maxiter 150 2>&1
 """
 
 import argparse

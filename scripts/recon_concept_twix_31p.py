@@ -437,7 +437,8 @@ def concept_reconstruct(kdata, kx_raw, ky_raw, N, fov_m, gamma_mhz_per_mt,
     # 2. FOV shift via phase ramp (MATLAB line 35-36)
     data = kdata.copy()
     if fov_shift is not None and (fov_shift[0] != 0 or fov_shift[1] != 0):
-        shift_phase = np.exp(-2j * np.pi * (kx_cpp * fov_shift[0] + ky_cpp * fov_shift[1]))
+        # MATLAB: exp(-2πi*(KXn*shiftPE + KYn*shiftRO)); fov_shift=(shiftRO,shiftPE)
+        shift_phase = np.exp(-2j * np.pi * (kx_cpp * fov_shift[1] + ky_cpp * fov_shift[0]))
         data = data * shift_phase[:, np.newaxis]
         print(f"  FOV shift: [{fov_shift[0]:.2f}, {fov_shift[1]:.2f}] voxels")
 
