@@ -17,15 +17,15 @@ Method (Taylor / linearised error propagation):
     Concentration covariance:
         Cov(c) = Sigma_theta[:K, :K]
 
-Reads  : <out_dir>/spice/V_subspace.npy
-         <out_dir>/fitting/spice_aligned.nii.gz     (data used for fitting)
-         <out_dir>/fitting/spice_fit.nii.gz/        (fsl_mrsi output dir)
+Reads  : <out_dir>/spice_<run_tag>/V_subspace.npy        (tag e.g. w5000_l0.0001)
+         <out_dir>/spice_<run_tag>/SPICE_phcorr.nii.gz
+         <out_dir>/fitting_<run_tag>/spice_fit/
          <data_dir>/wref_o.npy
          <data_dir>/sigma_noise.npy
-         <hess_dir>/mHm_*.npy                       (per-voxel Hessian blocks)
-         <basis_dir>/                               (fitting basis)
+         <out_dir>/hessian_<run_tag>/mHm_*.npy
+         <basis_dir>/
 
-Writes : <out_dir>/conc_uncertainty_analytical/
+Writes : <out_dir>/conc_uncertainty_analytical_<run_tag>/
              conc_std_analytical.npy           (Ny, Nx, K)  raw fit uncertainty
              conc_std_analytical_internal.npy  (Ny, Nx, K)  internal (ratio) uncertainty
              metab_names.npy
@@ -33,13 +33,13 @@ Writes : <out_dir>/conc_uncertainty_analytical/
              fig_12_internal_std_<metab>.png
 
 Usage:
-    python scripts/11_analytical_conc_uncertainty.py \
-        --data-dir  ./data/ \
+    python scripts/uncertainty/analytical/Uncert_04_analytical_conc_uncertainty.py \
+        --data-dir  data/processed/invivo_250305_01 \
         --basis-dir ./basis/ \
-        --out-dir   ./output \
-        --hess-dir  ./output/hessian \
+        --run-tag   w5000_l0.0001 \
         --rank 20 \
         --combine NAA NAAG --combine PCh GPC --combine Cr PCr \
+        --brain-threshold 0.16 --brain-erosion 1 \
         --plot-metabs NAA Cr Ins Glu PCh \
         [--vmax 4e-5]
 """
@@ -66,8 +66,9 @@ from fsl_mrs.core.nifti_mrs import NIFTI_MRS
 from fsl_mrs.utils.baseline import Baseline
 from fsl_mrs import models as fsl_models
 
-_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 sys.path.insert(0, _root)
+from utils.scan_params import load_scan_params
 
 
 # ── SpecToFID (inverse of fsl_mrs FIDToSpec convention) ───────────────────────
@@ -137,14 +138,16 @@ def internal_conc_uncertainty(cov_c, c_raw, ref_idxs):
 
 def _plot_std_map(name, std_2d, wref_norm, brain_mask_inner, out_path,
                   vmax=None, title_prefix="Analytical σ(c)", cbar_label="Std (arb. units)"):
-    masked = np.where(brain_mask_inner, std_2d, np.nan)
+    masked     = np.where(brain_mask_inner, std_2d, np.nan)
+    wref_masked = np.where(brain_mask_inner, wref_norm, np.nan)
+    import copy
+    _gray = copy.copy(plt.cm.get_cmap("gray"));  _gray.set_bad(color="black")
+    _reds = copy.copy(plt.cm.get_cmap("Reds"));  _reds.set_bad(color="black")
     fig, ax = plt.subplots(figsize=(6, 5), facecolor="black")
     ax.set_facecolor("black")
-    ax.imshow(wref_norm, origin="lower", cmap="gray", alpha=0.6, zorder=0)
+    ax.imshow(wref_masked, origin="lower", cmap=_gray, alpha=0.6, zorder=0)
     im = ax.imshow(masked, origin="lower", vmin=0, vmax=vmax,
-                   cmap="Reds", alpha=0.9, zorder=1)
-    ax.contour(brain_mask_inner, levels=[0.5], colors="white",
-               linewidths=0.7, zorder=2)
+                   cmap=_reds, alpha=0.9, zorder=1)
     ax.set_title(f"{title_prefix}: {name}", color="white")
     ax.tick_params(colors="white")
     for sp in ax.spines.values():
@@ -170,16 +173,17 @@ def parse_args():
                    help="Scan data dir (contains wref_o.npy, sigma_noise.npy)")
     p.add_argument("--basis-dir",        required=True,
                    help="Fitting basis dir (same as used in step 05)")
-    p.add_argument("--out-dir",          default="./output")
+    p.add_argument("--out-dir",          default=None,
+                   help="Output directory (default: ./output/<subject_id> derived from --data-dir)")
     p.add_argument("--hess-dir",         default=None,
                    help="Dir with mHm_*.npy (default: <out-dir>/hessian)")
     p.add_argument("--fit-dir",          default=None,
-                   help="fsl_mrsi output dir (default: <out-dir>/fitting/spice_fit.nii.gz)")
+                   help="fsl_mrsi output dir (default: <out-dir>/fitting_<run-tag>/spice_fit)")
     # Acquisition (must match 04/05)
-    p.add_argument("--dwelltime",        type=float, default=5e-6)
-    p.add_argument("--k-points",         type=int,   default=39842)
+    p.add_argument("--dwelltime",        type=float, default=None)
+    p.add_argument("--k-points",         type=int, default=None)
     p.add_argument("--n-seq-points",     type=int,   default=300)
-    p.add_argument("--center-freq",      type=float, default=297.219338)
+    p.add_argument("--center-freq",      type=float, default=None)
     p.add_argument("--ppm-center",       type=float, default=3.027)
     p.add_argument("--dim",              type=int,   nargs=2, default=[64, 64],
                    metavar=("NY", "NX"))
@@ -209,6 +213,9 @@ def parse_args():
                         "When set, the per-voxel rescale factor s=max|FID| is used "
                         "to restore original-scale concentrations for Jacobian "
                         "evaluation, fixing ill-conditioning of J_fid.")
+    p.add_argument("--run-tag",          default="",
+                   help="Run identifier from recon_01 (e.g. w5000_l0.0001); "
+                        "appended to spice/hessian/fitting subdir names")
     return p.parse_args()
 
 
@@ -217,10 +224,14 @@ def parse_args():
 def main():
     args     = parse_args()
     data_dir = args.data_dir.rstrip("/") + "/"
-    spice_dir = os.path.join(args.out_dir, "spice")
-    hess_dir  = args.hess_dir or os.path.join(args.out_dir, "hessian")
-    fit_dir   = args.fit_dir  or os.path.join(args.out_dir, "fitting", "spice_fit.nii.gz")
-    out_dir   = os.path.join(args.out_dir, "conc_uncertainty_analytical")
+    if args.out_dir is None:
+        args.out_dir = os.path.join("./output", os.path.basename(args.data_dir.rstrip("/")))
+    load_scan_params(args, data_dir, k_key="k_mrsi")
+    _tg       = lambda b: f"{b}_{args.run_tag}" if args.run_tag else b
+    spice_dir = os.path.join(args.out_dir, _tg("spice"))
+    hess_dir  = args.hess_dir or os.path.join(args.out_dir, _tg("hessian"))
+    fit_dir   = args.fit_dir  or os.path.join(args.out_dir, _tg("fitting"), "spice_fit")
+    out_dir   = os.path.join(args.out_dir, _tg("conc_uncertainty_analytical"))
     os.makedirs(out_dir, exist_ok=True)
 
     Ny, Nx  = args.dim
@@ -241,7 +252,7 @@ def main():
 
     # Noise variance (sigma_noise^2 scaling for mHm posterior covariance)
     sigma_noise = float(np.load(data_dir + "sigma_noise.npy"))
-    sigma2      = sigma_noise ** 2
+    sigma2      = 2.0 * sigma_noise ** 2  # σ_complex² = 2σ_real²; sigma_noise stores σ_real
     print(f"[step12] sigma_noise={sigma_noise:.4e}")
 
     # ── Set up fsl_mrs voigt model ─────────────────────────────────────────────
@@ -260,7 +271,7 @@ def main():
     print(f"[step12] Internal ref: {[metab_names[i] for i in ref_idxs]} (idxs {ref_idxs})")
 
     # Load aligned SPICE NIfTI to get dwelltime / cf for MRS object
-    aligned_nii_path = os.path.join(args.out_dir, "fitting", "spice_aligned.nii.gz")
+    aligned_nii_path = os.path.join(spice_dir, "SPICE_phcorr.nii.gz")
     nii_mrs  = NIFTI_MRS(aligned_nii_path)
     bw_data  = 1.0 / nii_mrs.dwelltime
     cf_data  = float(nii_mrs.spectrometer_frequency[0])
@@ -299,20 +310,23 @@ def main():
     voigt_jac = fsl_models.getModelJac("voigt")
 
     # ── Load fitted parameters from fsl_mrsi output ───────────────────────────
-    # NIfTI layout from fsl_mrsi: (Nx, Ny) — need [ix, iy] to access voxel (iy, ix)
+    # fsl_mrsi outputs (Nx_flipped, Ny); apply [::-1,:] on load → (Nx, Ny), access as [ix, iy]
     print("[step12] Loading fitted parameters …")
     fit_path = Path(fit_dir)
 
     conc_raw = np.zeros((Nx, Ny, K), dtype=np.float64)
     for k_idx, name in enumerate(metab_names):
         f = fit_path / "concs" / "raw" / f"{name}.nii.gz"
-        conc_raw[:, :, k_idx] = np.squeeze(nib.load(str(f)).get_fdata())
+        conc_raw[:, :, k_idx] = np.squeeze(nib.load(str(f)).get_fdata())[::-1, :]  # (Nx_flipped,Ny)→(Nx,Ny)
 
-    gamma_map = np.squeeze(nib.load(str(fit_path / "nuisance" / "gamma_group0.nii.gz")).get_fdata())
-    sigma_map = np.squeeze(nib.load(str(fit_path / "nuisance" / "sigma_group0.nii.gz")).get_fdata())
-    eps_map   = np.squeeze(nib.load(str(fit_path / "nuisance" / "shift_group0.nii.gz")).get_fdata())
-    phi0_map  = np.squeeze(nib.load(str(fit_path / "nuisance" / "p0.nii.gz")).get_fdata())
-    phi1_map  = np.squeeze(nib.load(str(fit_path / "nuisance" / "p1.nii.gz")).get_fdata())
+    def _load_nii_map(path):
+        return np.squeeze(nib.load(str(path)).get_fdata())[::-1, :]  # (Nx_flipped,Ny)→(Nx,Ny)
+
+    gamma_map = _load_nii_map(fit_path / "nuisance" / "gamma_group0.nii.gz")
+    sigma_map = _load_nii_map(fit_path / "nuisance" / "sigma_group0.nii.gz")
+    eps_map   = _load_nii_map(fit_path / "nuisance" / "shift_group0.nii.gz")
+    phi0_map  = _load_nii_map(fit_path / "nuisance" / "p0.nii.gz")
+    phi1_map  = _load_nii_map(fit_path / "nuisance" / "p1.nii.gz")
 
     # ── Per-voxel analytical uncertainty ─────────────────────────────────────
     # conc_std stored in (Ny, Nx, K) layout matching brain_mask
@@ -430,6 +444,37 @@ def main():
     print(f"[step12] Saved conc_std_analytical.npy          shape={conc_std.shape}")
     print(f"[step12] Saved conc_std_analytical_internal.npy shape={conc_std_internal.shape}")
 
+    # ── Save NIfTI + symlink into spice_fit/analytical/ for FSLeyes ─────────
+    fit_anal_dir = Path(fit_dir) / "analytical"
+    if Path(fit_dir).exists():
+        fit_anal_dir.mkdir(exist_ok=True)
+        _ref_conc = Path(fit_dir) / "concs" / "raw" / f"{metab_names[0]}.nii.gz"
+        _nii_aff  = nib.load(str(_ref_conc)).affine if _ref_conc.exists() else np.eye(4)
+
+        def _save_and_link(arr_ny_nx, name):
+            nii_data = np.ascontiguousarray(arr_ny_nx.T[::-1, :]).astype(np.float32)
+            nii_path = os.path.join(out_dir, f"anal_{name}_sd.nii.gz")
+            nib.save(nib.Nifti1Image(nii_data[:, :, np.newaxis], _nii_aff), nii_path)
+            dst = fit_anal_dir / f"anal_{name}_sd.nii.gz"
+            if dst.is_symlink() or dst.exists():
+                dst.unlink()
+            dst.symlink_to(os.path.abspath(nii_path))
+
+        for k_idx, name in enumerate(metab_names):
+            _save_and_link(conc_std[:, :, k_idx], name)
+        for name, arr in combined_stds.items():
+            _save_and_link(arr, name)
+        print(f"[step12] Saved + symlinked anal_*_sd.nii.gz → {fit_anal_dir}")
+
+        tree_path = Path(fit_dir) / "mrsi.tree"
+        if tree_path.exists():
+            tree_txt = tree_path.read_text()
+            anal_section = "analytical\n    anal_{metab}_sd.nii.gz              (anal-sd)\n"
+            if "analytical" not in tree_txt:
+                tree_txt = tree_txt.replace("qc\n", anal_section + "qc\n")
+                tree_path.write_text(tree_txt)
+                print("[step12] Patched mrsi.tree with analytical section")
+
     # ── Plot ─────────────────────────────────────────────────────────────────
     for meta in args.plot_metabs:
         # Individual metabolite — raw
@@ -439,10 +484,10 @@ def main():
             if args.vmax is not None:
                 vmax = args.vmax
             else:
-                valid = std_2d[brain_mask & np.isfinite(std_2d)]
+                valid = std_2d[brain_mask_inner & np.isfinite(std_2d)]
                 vmax  = float(np.percentile(valid, 90)) if len(valid) else None
             _plot_std_map(
-                meta, std_2d, wref_norm, brain_mask,
+                meta, std_2d, wref_norm, brain_mask_inner,
                 os.path.join(out_dir, f"fig_12_conc_std_{meta}.png"),
                 vmax=vmax,
             )
@@ -453,10 +498,10 @@ def main():
             if args.vmax is not None:
                 vmax_int = args.vmax
             else:
-                valid_int = std_2d_int[brain_mask & np.isfinite(std_2d_int)]
+                valid_int = std_2d_int[brain_mask_inner & np.isfinite(std_2d_int)]
                 vmax_int  = float(np.percentile(valid_int, 90)) if len(valid_int) else None
             _plot_std_map(
-                meta, std_2d_int, wref_norm, brain_mask,
+                meta, std_2d_int, wref_norm, brain_mask_inner,
                 os.path.join(out_dir, f"fig_12_internal_std_{meta}.png"),
                 vmax=vmax_int,
                 title_prefix="Internal σ(c/ref)",
@@ -470,11 +515,11 @@ def main():
                 if args.vmax is not None:
                     vmax = args.vmax
                 else:
-                    valid = arr[brain_mask & np.isfinite(arr)]
+                    valid = arr[brain_mask_inner & np.isfinite(arr)]
                     vmax  = float(np.percentile(valid, 90)) if len(valid) else None
                 safe  = name.replace("+", "_plus_")
                 _plot_std_map(
-                    name, arr, wref_norm, brain_mask,
+                    name, arr, wref_norm, brain_mask_inner,
                     os.path.join(out_dir, f"fig_12_conc_std_{safe}.png"),
                     vmax=vmax,
                 )
@@ -484,10 +529,10 @@ def main():
                 if args.vmax is not None:
                     vmax_int = args.vmax
                 else:
-                    valid_int = arr_int[brain_mask & np.isfinite(arr_int)]
+                    valid_int = arr_int[brain_mask_inner & np.isfinite(arr_int)]
                     vmax_int  = float(np.percentile(valid_int, 90)) if len(valid_int) else None
                 _plot_std_map(
-                    name, arr_int, wref_norm, brain_mask,
+                    name, arr_int, wref_norm, brain_mask_inner,
                     os.path.join(out_dir, f"fig_12_internal_std_{safe}.png"),
                     vmax=vmax_int,
                     title_prefix="Internal σ(c/ref)",

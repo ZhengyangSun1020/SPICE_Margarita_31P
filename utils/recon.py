@@ -316,10 +316,11 @@ def build_gram_for_worker(
         import torchkbnufft as tkbn
         T_D_TYPE = torch.complex64
 
+        toep_ob  = tkbn.ToepNufft().to(device_str)
+        kernel_t = torch.tensor(kernel_np).to(device_str)
+
         def _toep_mv(x_np):
-            x_t = torch.tensor(x_np.astype(D_TYPE), device=device_str).unsqueeze(0).unsqueeze(0)
-            kernel_t = torch.tensor(kernel_np).to(device_str)
-            toep_ob  = tkbn.ToepNufft().to(device_str)
+            x_t = torch.from_numpy(x_np.astype(D_TYPE)).reshape(1, 1, *im_size).to(device_str)
             return toep_ob(x_t, kernel_t, smaps=None, norm="ortho").squeeze().cpu().numpy().astype(D_TYPE).ravel()
 
         def _fid2spec(x):
@@ -332,7 +333,7 @@ def build_gram_for_worker(
         n = N_VOXEL * N_SEQ
         Gram_OP = _LO((n, n), matvec=_toep_mv, rmatvec=_toep_mv, dtype=D_TYPE)
         F1D     = _LO((n, n), matvec=_fid2spec, rmatvec=_spec2fid, dtype=D_TYPE)
-        return Gram_OP, F1D
+        return Gram_OP, F1D, None
 
     else:  # finufft
         import mrinufft
@@ -341,14 +342,10 @@ def build_gram_for_worker(
         NufftOpCls = mrinufft.get_operator("finufft")
         nufft_raw  = NufftOpCls(trej_np, shape=im_size, n_coils=n_coils, n_batchs=1,
                                  squeeze_dims=True, smaps=smap_time)
-        fop        = NUFFTLinearOperator(nufft_raw, img_shape=im_size,
-                                          n_samples=int(np.prod(trej_np.shape[:-1])), n_coils=n_coils, dtype=D_TYPE)
+        fop   = NUFFTLinearOperator(nufft_raw, img_shape=im_size,
+                                     n_samples=int(np.prod(trej_np.shape[:-1])), n_coils=n_coils, dtype=D_TYPE)
         F_loc = fop.to_scipy()
-        n     = N_VOXEL * N_SEQ
-        Gram_OP = _LO((n, n), matvec=lambda x: F_loc.rmatvec(F_loc.matvec(x.astype(D_TYPE))), dtype=D_TYPE)
-        _eye    = lambda x: np.asarray(x, dtype=D_TYPE)
-        F1D     = _LO((n, n), matvec=_eye, rmatvec=_eye, dtype=D_TYPE)
-        return Gram_OP, F1D
+        return None, None, F_loc  # caller uses F_loc.rmatvec/matvec directly; no Gram needed
 
 
 # ── B0 modulation matrices ────────────────────────────────────────────────────
@@ -609,6 +606,7 @@ def phase_corr(
     ref_img=None,
     out_fname: str = "phase_corr_tmp",
     method: str = 'phasta',
+    affine=None,
 ) -> np.ndarray:
     """
     Apply FSL-MRS 0th-order phase correction to MRSI FID data.
@@ -655,16 +653,16 @@ def phase_corr(
 
     Ny, Nx = img_shape[0], img_shape[1]
 
-    brain_mask_img = Image((mag_map_2d * brain_mask).transpose(1, 0))
+    brain_mask_img = Image(np.ascontiguousarray((mag_map_2d * brain_mask).T[::-1, :]))
 
     mrsi_f = mrsi_fid.reshape(Ny, Nx, -1)
-    mrsi_f_4 = mrsi_f.transpose(1, 0, 2)[:, :, np.newaxis, :]
+    mrsi_f_4 = np.ascontiguousarray(mrsi_f.transpose(1, 0, 2)[::-1, :, :])[:, :, np.newaxis, :]
 
-    if ref_img is None:
+    _affine = ref_img.voxToWorldMat if ref_img is not None else affine
+    if _affine is None:
         nifti_in = gen_nifti_mrs(mrsi_f_4, dwelltime=TS, spec_freq=297.219)
     else:
-        nifti_in = gen_nifti_mrs(mrsi_f_4, dwelltime=TS, spec_freq=297.219,
-                                  affine=ref_img.voxToWorldMat)
+        nifti_in = gen_nifti_mrs(mrsi_f_4, dwelltime=TS, spec_freq=297.219, affine=_affine)
 
     out_path = os.path.join(out_dir, out_fname + ".nii.gz")
     kwargs = dict(mask=brain_mask_img, ppmlim=list(ppmlim), method=method)
@@ -674,7 +672,7 @@ def phase_corr(
     phcorr_nifti.save(out_path)
 
     phcorr_img = Image(out_path)
-    mrsi_phcorr_f = np.array(np.transpose(np.array(phcorr_img[:, :, 0, :]), (1, 0, 2)))
+    mrsi_phcorr_f = np.ascontiguousarray(np.transpose(np.array(phcorr_img[:, :, 0, :]), (1, 0, 2)))[:, ::-1, :]
 
     return mrsi_phcorr_f.conj()
 
@@ -899,6 +897,9 @@ def SPICEWithSpatialConstrain_cg_nufft(
     x0: Optional[np.ndarray] = None,
     brain_mask_inner: Optional[np.ndarray] = None,
     PPM_AXIS: Optional[np.ndarray] = None,
+    dx_tol: float = 1e-6,
+    patience: int = 4,
+    patience_dx: int = 3,
 ) -> tuple:
     """
     SPICE CG solver with Toeplitz NUFFT and internal early stopping.
@@ -914,7 +915,7 @@ def SPICEWithSpatialConstrain_cg_nufft(
         raise ValueError("Only CG solver is currently supported in this wrapper.")
 
     if x0 is None:
-        print('[SPICE] Running iterative NUFFT for initial guess (30 iters)…')
+        print('[SPICE] Running iterative NUFFT for initial guess (5 iters)…')
         recon_nufft, _, b_init = iterative_nufft_recon(
             kspace=noisy_kt_spaces,
             B0_mat=B0_mat,
@@ -925,7 +926,7 @@ def SPICEWithSpatialConstrain_cg_nufft(
             n_coils=32,
             smaps=None,
             density_method=None,
-            maxiter=30,
+            maxiter=5,
             solver="cg",
         )
         U_init = recon_nufft.reshape(img_shape) @ np.linalg.pinv(V.conj().T)
@@ -958,10 +959,6 @@ def SPICEWithSpatialConstrain_cg_nufft(
 
     iter_count = 0
     pbar = tqdm(total=maxiter, desc="CG iters", unit="iter")
-
-    patience     = 4
-    patience_dx  = 3
-    dx_tol       = 1e-6
 
     best_x = x0.copy()
     Ax0    = A.matvec(x0)
@@ -1080,6 +1077,7 @@ def SPICEWithSpatialConstrain_cg_nufft_joint(
     PPM_AXIS: Optional[np.ndarray] = None,
     patience: int = 4,
     patience_dx: int = 3,
+    dx_tol: float = 1e-6,
 ) -> tuple:
     """
     SPICE CG solver supporting multiple rank blocks with per-block spatial regularization.
@@ -1095,7 +1093,7 @@ def SPICEWithSpatialConstrain_cg_nufft_joint(
     np.save(os.path.join(save_folder, 'Basis_V.npy'), V)
 
     if x0 is None:
-        print('[SPICE-joint] Running iterative NUFFT for initial guess (30 iters)…')
+        print('[SPICE-joint] Running iterative NUFFT for initial guess (5 iters)…')
         recon_nufft, _, b_init = iterative_nufft_recon(
             kspace=noisy_kt_spaces,
             B0_mat=B0_mat,
@@ -1106,7 +1104,7 @@ def SPICEWithSpatialConstrain_cg_nufft_joint(
             n_coils=32,
             smaps=None,
             density_method=None,
-            maxiter=30,
+            maxiter=5,
             solver="cg",
         )
         U_init = recon_nufft.reshape(img_shape) @ np.linalg.pinv(V.conj().T)
@@ -1136,7 +1134,6 @@ def SPICEWithSpatialConstrain_cg_nufft_joint(
 
     iter_count       = 0
     pbar             = tqdm(total=maxiter, desc="CG iters", unit="iter")
-    dx_tol           = 1e-6
 
     best_x           = x0.copy()
     Ax0              = A.matvec(x0)

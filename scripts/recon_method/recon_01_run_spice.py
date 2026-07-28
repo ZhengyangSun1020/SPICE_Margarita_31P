@@ -12,21 +12,24 @@ Reads  : <data_dir>/wref_o.npy
          <out_dir>/lipid_removal/kt_mrsi_lprm.npy
          <out_dir>/lipid_removal/mrsi_ksp_scaled.npy
          <basis_dir>/
-Writes : <out_dir>/spice/SPICE_result.nii.gz
-         <out_dir>/spice/SPICE_f.npy
-         <out_dir>/spice/U_est.npy
-         <out_dir>/spice/V_subspace.npy
+Writes : <out_dir>/spice_w<wmax>_l<lambda1>/SPICE_result.nii.gz
+         <out_dir>/spice_w<wmax>_l<lambda1>/SPICE_f.npy
+         <out_dir>/spice_w<wmax>_l<lambda1>/U_est.npy
+         <out_dir>/spice_w<wmax>_l<lambda1>/V_subspace.npy
+         (run tag e.g. w5000_l0.0001; printed on startup for use with --run-tag downstream)
 
 Usage:
     # torchnufft (default)
-    python scripts/04_run_spice.py \\
-        --data-dir ./data/ --basis-dir ./basis/ \\
+    python scripts/recon_method/recon_01_run_spice.py \
+        --data-dir data/processed/invivo_250305_01 --basis-dir ./basis/ \
+        --save-plots [--brain-threshold 0.16] [--brain-erosion 1] \
         [--backend torchnufft] [--rank 20] [--lambda1 1e-4] [--maxiter 120]
 
     # finufft
-    python scripts/04_run_spice.py \\
-        --data-dir ./data/ --basis-dir ./basis/ \\
-        --backend finufft [--rank 15] [--lambda1 1e-6] [--maxiter 120]
+    python scripts/recon_method/recon_01_run_spice.py \
+        --data-dir data/processed/invivo_250305_01 --basis-dir ./basis/ \
+        --backend finufft --save-plots [--brain-threshold 0.16] [--brain-erosion 3]
+        [--rank 15] [--lambda1 1e-4] [--maxiter 120] [--brain-mask-cleanup]
 """
 
 import argparse
@@ -36,20 +39,30 @@ import sys
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+plt.style.use("dark_background")
+plt.rcParams["axes.prop_cycle"] = plt.cycler(color=[
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+])
 import numpy as np
 import mrinufft
 from scipy.sparse.linalg import LinearOperator
 from scipy.ndimage import binary_erosion
 from warnings import filterwarnings
 filterwarnings("ignore")
+import nibabel as nib
 
 from fsl_mrs.utils import mrs_io
 from fsl_mrs.utils.misc import FIDToSpec
 from fsl_mrs.utils.plotting import FID2Spec
+from fsl_mrs.utils.synthetic import syntheticFromBasisFile
 from fsl.data.image import Image
 from nifti_mrs.create_nmrs import gen_nifti_mrs
+from fsl_mrs.core.nifti_mrs import gen_nifti_mrs as gen_nifti_mrs_fsl
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from utils.scan_params import load_scan_params
+from utils.pipeline_utils import make_brain_mask
 from utils.utils import (
     calc_Bmatrix,
     save_training_data_as_csv,
@@ -62,25 +75,26 @@ from utils.utils import (
     plot_voxel_sum_map,
     Calc_B0_matrix,
     NUFFTOp,
-    phase_corr,
     build_nufft_ops,
 )
+from utils.xcorr import my_mrsi_freq_align
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="SPICE reconstruction — step 4")
     p.add_argument("--data-dir",        required=True)
     p.add_argument("--basis-dir",       required=True)
-    p.add_argument("--out-dir",         default="./output")
+    p.add_argument("--out-dir",         default=None,
+                   help="Output directory (default: ./output/<subject_id> derived from --data-dir)")
     p.add_argument("--backend",         default="torchnufft",
                    choices=["torchnufft", "finufft"],
                    help="NUFFT backend: torchnufft (default) or finufft")
-    p.add_argument("--dwelltime",       type=float, default=5e-6)
-    p.add_argument("--k-points",        type=int,   default=39762)
+    p.add_argument("--dwelltime",       type=float, default=None)
+    p.add_argument("--k-points",        type=int, default=None)
     p.add_argument("--n-seq-points",    type=int,   default=300)
-    p.add_argument("--n-coils",         type=int,   default=32)
+    p.add_argument("--n-coils",         type=int, default=None)
     p.add_argument("--dim",             type=int,   nargs=2, default=[64, 64], metavar=("NX","NY"))
-    p.add_argument("--center-freq",     type=float, default=297.219338)
+    p.add_argument("--center-freq",     type=float, default=None)
     p.add_argument("--ppm-center",      type=float, default=3.027)
     p.add_argument("--n-shots",         type=int,   default=360,
                    help="Number of shots (torchnufft only, default: 360)")
@@ -93,16 +107,26 @@ def parse_args():
     p.add_argument("--pool-size",       type=int,   default=1)
     p.add_argument("--minpool",         action="store_true")
     p.add_argument("--maxiter",         type=int,   default=120)
+    p.add_argument("--dx-tol",          type=float, default=1e-6,
+                   help="Early-stop step-size tolerance for CG (default: 1e-6)")
+    p.add_argument("--patience",        type=int,   default=4,
+                   help="No-improvement steps before early stop (default: 4)")
+    p.add_argument("--patience-dx",     type=int,   default=3,
+                   help="Small-dx steps before early stop (default: 3)")
     # Training
     p.add_argument("--training-size",   type=int,   default=10000)
     p.add_argument("--csv-name",        default="SS_training")
-    p.add_argument("--reuse-training",  action="store_true")
     # Metabolites
     p.add_argument("--metabs",          nargs="+",
                    default=["Cr","GABA","Glu","Gln","GPC","GSH",
                              "Lac","NAA","NAAG","Ins","PCh","PCr","Tau","Asp","PE"])
     p.add_argument("--brain-threshold", type=float, default=0.08)
     p.add_argument("--brain-erosion",   type=int,   default=3)
+    p.add_argument("--brain-mask-cleanup", action="store_true",
+                   help="Extra cleanup pass on the thresholded brain mask: keep only the "
+                        "largest connected component (drops disconnected noise blobs outside "
+                        "the brain) and fill enclosed holes (e.g. a central signal void). "
+                        "Default: off, use only if a single global threshold isn't enough.")
     p.add_argument("--ref-nii",         default=None)
     p.add_argument("--save-plots",      action="store_true")
     return p.parse_args()
@@ -111,7 +135,12 @@ def parse_args():
 def main():
     args     = parse_args()
     data_dir = args.data_dir.rstrip("/") + "/"
-    out_dir  = os.path.join(args.out_dir, "spice")
+    if args.out_dir is None:
+        args.out_dir = os.path.join("./output", os.path.basename(args.data_dir.rstrip("/")))
+    load_scan_params(args, data_dir, k_key="k_mrsi")
+    run_tag  = f"w{args.wmax:g}_l{args.lambda1:g}"
+    out_dir  = os.path.join(args.out_dir, f"spice_{run_tag}")
+    print(f"[spice] Run tag: {run_tag}  (pass --run-tag {run_tag} to downstream scripts)")
     os.makedirs(out_dir, exist_ok=True)
 
     coilmap_dir = os.path.join(args.out_dir, "coilmap")
@@ -170,10 +199,9 @@ def main():
     smap_time = coil_smap.squeeze(0)   # (C, Ny, Nx, T)
 
     # ── Brain mask ───────────────────────────────────────────────────────────────
-    wref_2d   = np.abs(wref_img.squeeze(-1))
-    wref_norm = (wref_2d - wref_2d.min()) / (wref_2d.max() - wref_2d.min() + 1e-12)
-    brain_mask       = wref_norm > args.brain_threshold
-    brain_mask_inner = binary_erosion(brain_mask, iterations=args.brain_erosion)
+    wref_norm, brain_mask, brain_mask_inner = make_brain_mask(
+        wref_img, args.brain_threshold, args.brain_erosion,
+        cleanup=args.brain_mask_cleanup)
 
     # ── Build NUFFT operators ─────────────────────────────────────────────────────
     F_OP, Gram_OP, F1D, device_str = build_nufft_ops(
@@ -207,6 +235,17 @@ def main():
     )
     WW = W_edge.conj().T @ W_edge
 
+    wref_masked = wref_norm * brain_mask
+
+    if args.save_plots:
+        fig, ax = plt.subplots(figsize=(6, 5))
+        ax.imshow(wref_masked, origin="lower", cmap="gray")
+        ax.set_title("wref_o (masked)")
+        plt.tight_layout()
+        fig.savefig(os.path.join(out_dir, "fig_04_wref_masked.png"), dpi=120)
+        plt.close(fig)
+        print("[spice] Saved fig_04_wref_masked.png")
+
     if args.save_plots:
         edge_index = [tuple(pair) for pair in Nb]
 
@@ -233,10 +272,10 @@ def main():
         plt.close("all")
 
     # ── Subspace training ────────────────────────────────────────────────────────
-    csv_path = os.path.join(out_dir, args.csv_name + ".csv")
-    if args.reuse_training and os.path.exists(csv_path):
+    csv_path = os.path.join(args.basis_dir, args.csv_name + ".csv")
+    if os.path.exists(csv_path):
         print(f"[spice] Loading existing training data: {csv_path}")
-        training_dataset = read_training_data_from_csv(out_dir, args.csv_name).astype(D_TYPE)
+        training_dataset = read_training_data_from_csv(args.basis_dir, args.csv_name).astype(D_TYPE)
     else:
         print(f"[spice] Generating {args.training_size} synthetic training samples …")
         rng      = np.random.default_rng()
@@ -249,7 +288,7 @@ def main():
             args.training_size, freq_shift=train_fs, whole_shift=train_ws,
             N_SEQ_POINTS=N_SEQ,
         ).astype(D_TYPE)
-        save_training_data_as_csv(training_dataset, out_dir, args.csv_name, savecondition=True)
+        save_training_data_as_csv(training_dataset, args.basis_dir, args.csv_name, savecondition=True)
 
     print(f"[spice] SVD of training data {training_dataset.shape} …")
     _, s, Vh = np.linalg.svd(training_dataset)
@@ -276,6 +315,9 @@ def main():
         N_Vox=N_VOXEL, NUM_SPICE_RANK=args.rank,
         WW=WW, Solver="cg",
         lamda_1=args.lambda1, maxiter=args.maxiter,
+        dx_tol           = args.dx_tol,
+        patience         = args.patience,
+        patience_dx      = args.patience_dx,
         brain_mask_inner = brain_mask_inner,
         PPM_AXIS         = PPM_AXIS,
     )
@@ -286,39 +328,62 @@ def main():
     np.save(os.path.join(out_dir, "SPICE_f.npy"), spice_est)
     np.save(os.path.join(out_dir, "U_est.npy"),   est_U)
 
-    ref_img_path = args.ref_nii or (data_dir + "meas_MID00125_FID81014_mrsi_64_cr_adj300.nii.gz")
-    try:
-        ref_img_obj = Image(ref_img_path)
+    # Priority: (1) --ref-nii arg, (2) affine.npy saved by data_proc_01_twix2npy,
+    # (3) subject-specific reference NIfTI in data_dir, (4) identity
+    _affine_npy = data_dir + "affine.npy"
+    if args.ref_nii:
+        ref_img_obj = Image(args.ref_nii)
         affine      = ref_img_obj.voxToWorldMat
-    except Exception:
+    elif os.path.exists(_affine_npy):
+        affine      = np.load(_affine_npy)
         ref_img_obj = None
-        affine      = np.eye(4)
+        print(f"[spice] Loaded affine from {_affine_npy}")
+    else:
+        ref_img_path = data_dir + "meas_MID00125_FID81014_mrsi_64_cr_adj300.nii.gz"
+        try:
+            ref_img_obj = Image(ref_img_path)
+            affine      = ref_img_obj.voxToWorldMat
+        except Exception:
+            ref_img_obj = None
+            affine      = np.eye(4)
+
+    wref_nii = nib.Nifti1Image(
+        np.ascontiguousarray(wref_masked.T[::-1, :])[:, :, np.newaxis].astype(np.float32),
+        affine)
+    wref_nii.header.set_xyzt_units("mm")
+    nib.save(wref_nii, os.path.join(out_dir, "wref_masked.nii.gz"))
+    print("[spice] Saved wref_masked.nii.gz")
 
     spice_3d = spice_est.reshape(Ny, Nx, N_SEQ)
 
-    # ── Phase correction ─────────────────────────────────────────────────────────
-    print(f"[spice] Phase correction  ppmlim={args.phase_ppmlim} …")
-    spice_phcorr_f = phase_corr(
-        spice_3d,
-        mag_map_2d = wref_2d,
-        brain_mask = brain_mask_inner,
-        TS         = TS,
-        img_shape  = Dim_Voxel,
-        out_dir    = out_dir,
-        ppmlim     = args.phase_ppmlim,
-        ref_img    = ref_img_obj,
-        out_fname  = "SPICE_phcorr",
-    )
-    spice_phcorr = FIDToSpec(spice_phcorr_f, axis=-1)
-
-    # ── Save NIfTI-MRS ────────────────────────────────────────────────────────────
-    spice_save = spice_phcorr_f.transpose(1, 0, 2)[:, :, np.newaxis, :]
-    gen_nifti_mrs(spice_save.conj(), dwelltime=TS, spec_freq=297.219, affine=affine).save(
+    # ── Save raw SPICE result (pre-alignment) ─────────────────────────────────────
+    spice_raw_save = np.ascontiguousarray(spice_3d.transpose(1, 0, 2)[::-1, :, :])[:, :, np.newaxis, :]
+    gen_nifti_mrs(spice_raw_save, dwelltime=TS, spec_freq=297.219, affine=affine).save(
         os.path.join(out_dir, "SPICE_result.nii.gz"))
     print("[spice] Saved SPICE_result.nii.gz")
 
+    # ── xcorr frequency alignment (replaces FSL-MRS phase_corr) ─────────────────
+    print("[spice] xcorr frequency alignment …")
+    fid_ref, emptymrs, _ = syntheticFromBasisFile(
+        fullbasis, noisecovariance=[[0]], bandwidth=sweepwidth, points=N_SEQ)
+    basis_nmrs = gen_nifti_mrs_fsl(
+        fid_ref.conj().reshape(1, 1, 1, N_SEQ),
+        dwelltime=emptymrs.dwellTime,
+        spec_freq=emptymrs.centralFrequency,
+        affine=affine,
+    )
+    spice_nii = gen_nifti_mrs(
+        np.ascontiguousarray(spice_3d.transpose(1, 0, 2)[::-1, :, :])[:, :, np.newaxis, :],
+        dwelltime=TS, spec_freq=297.219, affine=affine,
+    )
+    spice_aligned_nmrs, _ = my_mrsi_freq_align(spice_nii, basis_nmrs)
+    spice_aligned_nmrs.save(os.path.join(out_dir, "SPICE_phcorr.nii.gz"))
+    print("[spice] Saved SPICE_phcorr.nii.gz")
+    spice_phcorr_f = np.array(spice_aligned_nmrs.image[:, :, 0, :]).transpose(1, 0, 2)[:, ::-1, :].conj()
+    spice_phcorr = FIDToSpec(spice_phcorr_f, axis=-1)
+
     # ── Save U and V as NIfTI ─────────────────────────────────────────────────
-    U_nii = est_U.reshape(Ny, Nx, args.rank).transpose(1, 0, 2)[:, :, np.newaxis, :].conj().astype(np.complex64)
+    U_nii = np.ascontiguousarray(est_U.reshape(Ny, Nx, args.rank).transpose(1, 0, 2)[::-1, :, :])[:, :, np.newaxis, :].conj().astype(np.complex64)
     Image(U_nii, xform=affine).save(os.path.join(out_dir, "U_subspace.nii.gz"))
 
     V_nmrs = np.tile(V[np.newaxis, np.newaxis, np.newaxis, :, :], (Nx, Ny, 1, 1, 1)).conj()

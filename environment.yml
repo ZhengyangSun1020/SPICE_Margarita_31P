@@ -1,4 +1,4 @@
-name: SPICE_MARGARITA
+name: VULCAN
 channels:
   - https://fsl.fmrib.ox.ac.uk/fsldownloads/fslconda/public/
   - conda-forge

@@ -22,12 +22,9 @@ Writes : <out_dir>/iter_recon/iter_recon.nii.gz         (FID, NIfTI-MRS)
          <out_dir>/iter_recon/fig_06_*.png
 
 Usage:
-    python scripts/06_iterative_nufft_recon.py \\
-        --data-dir ./data/ \\
-        [--out-dir ./output] [--maxiter 150] [--solver cg]
-
-        
-    python scripts/06_iterative_nufft_recon.py --data-dir ./data/ --out-dir ./output --backend finufft --maxiter 150 2>&1
+    python scripts/recon_method/recon_03_iterative_nufft_recon.py \
+        --data-dir data/processed/invivo_250305_01 \
+        [--maxiter 150] [--solver cg]
 """
 
 import argparse
@@ -48,7 +45,8 @@ from fsl.data.image import Image
 from nifti_mrs.create_nmrs import gen_nifti_mrs
 from fsl_mrs.utils.misc import FIDToSpec
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from utils.scan_params import load_scan_params
 from utils.utils import (
     Calc_B0_matrix,
     NUFFTOp,
@@ -62,17 +60,18 @@ from utils.utils import (
 def parse_args():
     p = argparse.ArgumentParser(description="Iterative NUFFT reconstruction — step 6")
     p.add_argument("--data-dir",        required=True)
-    p.add_argument("--out-dir",         default="./output")
+    p.add_argument("--out-dir",         default=None,
+                   help="Output directory (default: ./output/<subject_id> derived from --data-dir)")
     p.add_argument("--backend",         default="torchnufft",
                    choices=["torchnufft", "finufft"])
-    p.add_argument("--dwelltime",       type=float, default=5e-6)
-    p.add_argument("--k-points",        type=int,   default=39762)
+    p.add_argument("--dwelltime",       type=float, default=None)
+    p.add_argument("--k-points",        type=int, default=None)
     p.add_argument("--n-seq-points",    type=int,   default=300)
-    p.add_argument("--n-coils",         type=int,   default=32)
+    p.add_argument("--n-coils",         type=int, default=None)
     p.add_argument("--n-shots",         type=int,   default=360)
     p.add_argument("--dim",             type=int,   nargs=2, default=[64, 64],
                    metavar=("NY", "NX"))
-    p.add_argument("--center-freq",     type=float, default=297.219338)
+    p.add_argument("--center-freq",     type=float, default=None)
     p.add_argument("--ppm-center",      type=float, default=3.027)
     p.add_argument("--maxiter",         type=int,   default=150)
     p.add_argument("--rtol",            type=float, default=1e-3)
@@ -90,6 +89,9 @@ def parse_args():
 def main():
     args    = parse_args()
     data_dir    = args.data_dir.rstrip("/") + "/"
+    if args.out_dir is None:
+        args.out_dir = os.path.join("./output", os.path.basename(args.data_dir.rstrip("/")))
+    load_scan_params(args, data_dir, k_key="k_mrsi")
     lprm_dir    = os.path.join(args.out_dir, "lipid_removal")
     coilmap_dir = os.path.join(args.out_dir, "coilmap")
     b0map_dir   = os.path.join(args.out_dir, "b0map")
@@ -224,13 +226,24 @@ def main():
     B0_FAKE = np.ones_like(B0_mat) # for no b0 correction needed
 
     # ── Reference NIfTI affine ────────────────────────────────────────────────
-    ref_nii = args.ref_nii or (data_dir + "meas_MID00125_FID81014_mrsi_64_cr_adj300.nii.gz")
-    try:
-        ref_img_obj = Image(ref_nii)
+    # Priority: (1) --ref-nii arg, (2) affine.npy saved by data_proc_01_twix2npy,
+    # (3) subject-specific reference NIfTI in data_dir, (4) identity
+    _affine_npy = data_dir + "affine.npy"
+    if args.ref_nii:
+        ref_img_obj = Image(args.ref_nii)
         affine      = ref_img_obj.voxToWorldMat
-    except Exception:
+    elif os.path.exists(_affine_npy):
+        affine      = np.load(_affine_npy)
         ref_img_obj = None
-        affine      = np.eye(4)
+        print(f"[iter-recon] Loaded affine from {_affine_npy}")
+    else:
+        ref_nii = data_dir + "meas_MID00125_FID81014_mrsi_64_cr_adj300.nii.gz"
+        try:
+            ref_img_obj = Image(ref_nii)
+            affine      = ref_img_obj.voxToWorldMat
+        except Exception:
+            ref_img_obj = None
+            affine      = np.eye(4)
 
     # ── Run iterative NUFFT recon ─────────────────────────────────────────────
     print(f"[iter-recon] Running CG  maxiter={args.maxiter}  solver={args.solver} …")
@@ -258,7 +271,7 @@ def main():
 
     # ── Save as NIfTI-MRS (FID) ───────────────────────────────────────────────
     for fname, data in [("iter_recon.nii.gz", recon_3d), ("adjoint.nii.gz", b_init_3d)]:
-        nii_data = data.transpose(1, 0, 2)[:, :, np.newaxis, :]  # (Nx, Ny, 1, N_SEQ)
+        nii_data = np.ascontiguousarray(data.transpose(1, 0, 2)[::-1, :, :])[:, :, np.newaxis, :]  # (Nx, Ny, 1, N_SEQ)
         gen_nifti_mrs(nii_data.conj(), dwelltime=TS, spec_freq=297.219, affine=affine).save(
             os.path.join(out_dir, fname))
         print(f"[iter-recon] Saved {fname}")

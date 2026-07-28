@@ -10,17 +10,17 @@ Reads  : <data_dir>/wref_o.npy
          <out_dir>/coilmap/ecalib_pp.npy
          <out_dir>/b0map/B0_map.npy
          <out_dir>/lipid_removal/mrsi_ksp_scaled.npy
-         <out_dir>/spice/V_subspace.npy
-         <out_dir>/spice/U_est.npy
-Writes : <out_dir>/lobpcg/lobpcg_Q.npy          (eigenvectors, shape d×k)
-         <out_dir>/lobpcg/lobpcg_vals.npy        (eigenvalues, shape k)
-         <out_dir>/lobpcg/posterior_std.npy      (Ny, Nx, N_seq)
-         <out_dir>/lobpcg/fig_10_uncert_map.png
+         <out_dir>/spice_<run_tag>/V_subspace.npy    (tag e.g. w5000_l0.0001)
+         <out_dir>/spice_<run_tag>/U_est.npy
+Writes : <out_dir>/lobpcg_<run_tag>_k<k_eig>/lobpcg_Q.npy     (eigenvectors, shape d×k)
+         <out_dir>/lobpcg_<run_tag>_k<k_eig>/lobpcg_vals.npy   (eigenvalues, shape k)
+         <out_dir>/lobpcg_<run_tag>_k<k_eig>/posterior_std.npy (Ny, Nx, N_seq)
+         <out_dir>/lobpcg_<run_tag>_k<k_eig>/fig_10_uncert_map.png
 
 Usage:
-    python scripts/10_prefitting_uncertainty_lobpcg.py \
-        --data-dir ./data/ \
-        --out-dir  ./output \
+    python scripts/uncertainty/analytical/Uncert_03_prefitting_uncertainty_lobpcg.py \
+        --data-dir data/processed/invivo_250305_01 \
+        --run-tag  w5000_l0.0001 \
         --rank 20 --k-eig 50 --n-samples 100 \
         [--damp 0.0] [--lobpcg-maxiter 200]
 """
@@ -49,8 +49,9 @@ from scipy.sparse.linalg import LinearOperator, lobpcg
 from tqdm import tqdm
 from typing import Optional, Tuple
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils.utils import NUFFTOp, calc_Bmatrix, read_training_data_from_csv, Calc_B0_matrix_mx, build_nufft_ops
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
+from utils.scan_params import load_scan_params
+from utils.utils import NUFFTOp, calc_Bmatrix, Calc_B0_matrix_mx, build_nufft_ops
 
 D_TYPE   = np.complex64
 T_D_TYPE = torch.complex64
@@ -191,9 +192,7 @@ def plot_average_variation(spice_test, img_shape, voxel_x, voxel_y,
     nx, ny, nt = img_shape
     img = np.asarray(spice_test).reshape(nx, ny, nt)
     mag = np.mean(np.abs(img), axis=-1)
-    mag_masked = mag.copy()
-    if brain_mask is not None:
-        mag_masked[~brain_mask] = np.nan
+    mag_masked = np.where(brain_mask, mag, np.nan) if brain_mask is not None else mag
     spec = img[voxel_y, voxel_x, :].astype(np.complex128)
     x_ax = PPM_AXIS if PPM_AXIS is not None else np.arange(nt)
 
@@ -208,7 +207,7 @@ def plot_average_variation(spice_test, img_shape, voxel_x, voxel_y,
             ax.yaxis.label.set_color("white")
             for sp in ax.spines.values(): sp.set_color("white")
 
-    im0 = axs[0].imshow(np.abs(mag), cmap="viridis", origin="lower")
+    im0 = axs[0].imshow(mag_masked, cmap="viridis", origin="lower")
     axs[0].set_title("Avg magnitude")
     plt.colorbar(im0, ax=axs[0], fraction=0.046)
     axs[0].add_patch(Rectangle((voxel_x-.5, voxel_y-.5), 1, 1,
@@ -234,13 +233,14 @@ def plot_average_variation(spice_test, img_shape, voxel_x, voxel_y,
 def parse_args():
     p = argparse.ArgumentParser(description="LOBPCG uncertainty — step 10")
     p.add_argument("--data-dir",        required=True)
-    p.add_argument("--out-dir",         default="./output")
-    p.add_argument("--dwelltime",       type=float, default=5e-6)
-    p.add_argument("--k-points",        type=int,   default=39762)
+    p.add_argument("--out-dir",         default=None,
+                   help="Output directory (default: ./output/<subject_id> derived from --data-dir)")
+    p.add_argument("--dwelltime",       type=float, default=None)
+    p.add_argument("--k-points",        type=int, default=None)
     p.add_argument("--n-seq-points",    type=int,   default=300)
-    p.add_argument("--n-coils",         type=int,   default=32)
+    p.add_argument("--n-coils",         type=int, default=None)
     p.add_argument("--dim",             type=int,   nargs=2, default=[64, 64])
-    p.add_argument("--center-freq",     type=float, default=297.219338)
+    p.add_argument("--center-freq",     type=float, default=None)
     p.add_argument("--ppm-center",      type=float, default=3.027)
     p.add_argument("--rank",            type=int,   default=20)
     p.add_argument("--lambda",          type=float, default=1e-4, dest="lam")
@@ -269,6 +269,9 @@ def parse_args():
     p.add_argument("--threshold",       type=float, default=5e-5)
     p.add_argument("--dark-mode",       action="store_true", default=True)
     p.add_argument("--no-dark-mode",    dest="dark_mode", action="store_false")
+    p.add_argument("--run-tag",         default="",
+                   help="Run identifier from recon_01 (e.g. w5000_l0.0001); "
+                        "appended to spice/lobpcg subdir names")
     return p.parse_args()
 
 
@@ -277,11 +280,15 @@ def parse_args():
 def main():
     args      = parse_args()
     data_dir  = args.data_dir.rstrip("/") + "/"
+    if args.out_dir is None:
+        args.out_dir = os.path.join("./output", os.path.basename(args.data_dir.rstrip("/")))
+    load_scan_params(args, data_dir, k_key="k_mrsi")
     coilmap_dir = os.path.join(args.out_dir, "coilmap")
     b0map_dir   = os.path.join(args.out_dir, "b0map")
     lprm_dir    = os.path.join(args.out_dir, "lipid_removal")
-    spice_dir   = os.path.join(args.out_dir, "spice")
-    out_dir     = os.path.join(args.out_dir, "lobpcg")
+    _tg         = lambda b: f"{b}_{args.run_tag}" if args.run_tag else b
+    spice_dir   = os.path.join(args.out_dir, _tg("spice"))
+    out_dir     = os.path.join(args.out_dir, f"{_tg('lobpcg')}_k{args.k_eig}")
     os.makedirs(out_dir, exist_ok=True)
 
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -312,7 +319,7 @@ def main():
     sigma_noise_path = data_dir + "sigma_noise.npy"
     if os.path.exists(sigma_noise_path):
         sigma_noise = float(np.load(sigma_noise_path))
-        sigma2 = sigma_noise ** 2
+        sigma2 = 2.0 * sigma_noise ** 2  # σ_complex² = 2σ_real²; sigma_noise stores σ_real
         print(f"[lobpcg] sigma_noise={sigma_noise:.4e}  sigma2={sigma2:.4e}")
     else:
         sigma2 = args.sigma2
@@ -334,7 +341,7 @@ def main():
     )
     WW = (W_edge.conj().T @ W_edge).astype(D_TYPE)
 
-    B0_mat = Calc_B0_matrix_mx(np.nan_to_num(-B0_map, nan=0.0), TIME_AXIS)  # (N_vox, N_seq)
+    B0_mat = Calc_B0_matrix_mx(np.nan_to_num(B0_map, nan=0.0), TIME_AXIS)   # (N_vox, N_seq)
 
     # ── NUFFT operators ───────────────────────────────────────────────────────
     trej = mrsi_ksp_scaled.T.astype(np.float32)
@@ -375,13 +382,17 @@ def main():
     np.save(os.path.join(out_dir, "posterior_std.npy"), posterior_std)
     print(f"[lobpcg] Saved posterior_std.npy  shape={posterior_std.shape}")
 
+    mean_spec = np.mean(sim_spec, axis=0)              # (Ny, Nx, N_seq)
+    np.save(os.path.join(out_dir, "mean_spec.npy"), mean_spec)
+    print(f"[lobpcg] Saved mean_spec.npy  shape={mean_spec.shape}")
+
     # ── Plots ─────────────────────────────────────────────────────────────────
     fig = plot_average_variation(
         spice_test  = posterior_std,
         img_shape   = im_size,
         voxel_x     = args.voxel_x,
         voxel_y     = args.voxel_y,
-        brain_mask  = brain_mask,
+        brain_mask  = brain_mask_inner,
         PPM_AXIS    = PPM_AXIS,
         threshold   = args.threshold,
         dark_mode   = args.dark_mode,
@@ -393,7 +404,6 @@ def main():
     print(f"[lobpcg] Saved {path}")
 
     # mean spectrum plot
-    mean_spec = np.mean(sim_spec, axis=0)
     fig2 = plot_average_variation(
         spice_test = mean_spec,
         img_shape  = im_size,

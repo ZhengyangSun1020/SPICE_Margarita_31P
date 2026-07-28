@@ -13,10 +13,9 @@ Outputs (in <out-dir>/adjoint_test/):
   fig_adj_center_voxel.png  — single center-voxel spectrum
 
 Usage:
-    python scripts/05_adjoint_recon.py \
-        --data-dir ./data/ \
-        --out-dir  ./output \
-        --rank 20 --dim 64 64 --n-seq-points 300 --k-points 39842
+    python scripts/recon_method/recon_02_adjoint_recon.py \
+        --data-dir data/processed/invivo_250305_01 --basis-dir ./basis/ \
+        --rank 20 --dim 64 64 --n-seq-points 300
 """
 
 import argparse
@@ -42,23 +41,26 @@ from fsl_mrs.utils.misc import FIDToSpec, SpecToFID
 from fsl_mrs.utils.synthetic import syntheticFromBasisFile
 from fsl_mrs.core.nifti_mrs import gen_nifti_mrs as gen_nifti_mrs_fsl
 
-_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _root)
+from utils.scan_params import load_scan_params
 from utils.xcorr import my_mrsi_freq_align
+from utils.pipeline_utils import patch_spicefit_tree
 from utils.utils import NUFFTOp, plot_voxel_spectrum_and_maps, read_training_data_from_csv, phase_corr, Calc_B0_matrix
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Adjoint NUFFT diagnostic")
     p.add_argument("--data-dir",        required=True)
-    p.add_argument("--out-dir",         default="./output")
-    p.add_argument("--dwelltime",       type=float, default=5e-6)
-    p.add_argument("--k-points",        type=int,   default=39842)
+    p.add_argument("--out-dir",         default=None,
+                   help="Output directory (default: ./output/<subject_id> derived from --data-dir)")
+    p.add_argument("--dwelltime",       type=float, default=None)
+    p.add_argument("--k-points",        type=int, default=None)
     p.add_argument("--n-seq-points",    type=int,   default=300)
-    p.add_argument("--n-coils",         type=int,   default=32)
+    p.add_argument("--n-coils",         type=int, default=None)
     p.add_argument("--n-shots",         type=int,   default=360)
     p.add_argument("--dim",             type=int,   nargs=2, default=[64, 64], metavar=("NX", "NY"))
-    p.add_argument("--center-freq",     type=float, default=297.219338)
+    p.add_argument("--center-freq",     type=float, default=None)
     p.add_argument("--ppm-center",      type=float, default=3.027)
     p.add_argument("--backend",         default="finufft", choices=["torchnufft", "finufft"])
     p.add_argument("--brain-threshold", type=float, default=0.08)
@@ -80,6 +82,9 @@ def parse_args():
 def main():
     args = parse_args()
     data_dir    = args.data_dir.rstrip("/") + "/"
+    if args.out_dir is None:
+        args.out_dir = os.path.join("./output", os.path.basename(args.data_dir.rstrip("/")))
+    load_scan_params(args, data_dir, k_key="k_mrsi")
     lprm_dir    = os.path.join(args.out_dir, "lipid_removal")
     coilmap_dir = os.path.join(args.out_dir, "coilmap")
     b0map_dir   = os.path.join(args.out_dir, "b0map")
@@ -199,16 +204,28 @@ def main():
     print(f"[adj-test] image_adj  shape={image_adj.shape}  |max|={np.abs(image_adj).max():.4e}")
 
     # ── Save as NIfTI-MRS ─────────────────────────────────────────────────────────
-    ref_img_path = args.ref_nii or (data_dir + "meas_MID00125_FID81014_mrsi_64_cr_adj300.nii.gz")
-    try:
-        ref_img_obj = Image(ref_img_path)
+    # Priority: (1) --ref-nii arg, (2) affine.npy saved by data_proc_01_twix2npy,
+    # (3) subject-specific reference NIfTI in data_dir, (4) identity
+    _affine_npy = data_dir + "affine.npy"
+    if args.ref_nii:
+        ref_img_obj = Image(args.ref_nii)
         affine      = ref_img_obj.voxToWorldMat
-    except Exception:
+    elif os.path.exists(_affine_npy):
+        affine      = np.load(_affine_npy)
         ref_img_obj = None
-        affine      = np.eye(4)
+        print(f"[adj-test] Loaded affine from {_affine_npy}")
+    else:
+        ref_img_path = data_dir + "meas_MID00125_FID81014_mrsi_64_cr_adj300.nii.gz"
+        try:
+            ref_img_obj = Image(ref_img_path)
+            affine      = ref_img_obj.voxToWorldMat
+        except Exception:
+            ref_img_obj = None
+            affine      = np.eye(4)
 
     # ── Save raw adjoint as NIfTI-MRS (FID) ──────────────────────────────────
-    nii_data  = SpecToFID(image_adj, axis=-1).transpose(1, 0, 2)[:, :, np.newaxis, :]  # (Nx, Ny, 1, N_SEQ)
+    _fid_lr   = np.ascontiguousarray(SpecToFID(image_adj, axis=-1).transpose(1, 0, 2)[::-1, :, :])
+    nii_data  = _fid_lr[:, :, np.newaxis, :]  # (Nx, Ny, 1, N_SEQ); ascontiguousarray avoids negative-stride issues in gen_nifti_mrs
     nifti_adj = gen_nifti_mrs(nii_data, dwelltime=TS, spec_freq=297.219, affine=affine)
     nifti_adj.save(os.path.join(out_dir, "adj_recon.nii.gz"))
     print("[adj-test] Saved adj_recon.nii.gz")
@@ -216,9 +233,11 @@ def main():
     # ── Alignment ─────────────────────────────────────────────────────────────
     adj_fid = SpecToFID(image_adj, axis=-1)   # (Ny, Nx, N_SEQ) FID
 
+    if args.align_method == "xcorr" and args.basis_dir is None:
+        print("[adj-test] WARNING: --basis-dir not provided; falling back to phase_corr")
+        args.align_method = "phase_corr"
+
     if args.align_method == "xcorr":
-        if args.basis_dir is None:
-            raise ValueError("--basis-dir is required for --align-method xcorr")
         print("[adj-test] Building basis_nmrs for xcorr …")
         fullbasis = mrs_io.read_basis(args.basis_dir)
         fid_ref, emptymrs, _ = syntheticFromBasisFile(
@@ -287,10 +306,10 @@ def main():
 
     # ── SVD from SS training dataset → V → project adjoint ───────────────────────
     spice_dir = os.path.join(args.out_dir, "spice")
-    csv_path  = os.path.join(spice_dir, args.csv_name + ".csv")
+    csv_path  = os.path.join(args.basis_dir, args.csv_name + ".csv")
     if os.path.exists(csv_path):
         print(f"[adj-test] Loading SS training data: {csv_path} …")
-        training_dataset = read_training_data_from_csv(spice_dir, args.csv_name).astype(np.complex64)
+        training_dataset = read_training_data_from_csv(args.basis_dir, args.csv_name).astype(np.complex64)
         print(f"[adj-test] training_dataset shape={training_dataset.shape}")
 
         print(f"[adj-test] SVD (rank={args.rank}) …")
@@ -327,6 +346,10 @@ def main():
     else:
         print(f"[adj-test] {csv_path} not found — skipping SVD projection")
 
+    patch_spicefit_tree(args.out_dir, [
+        ("adj_recon.nii.gz", os.path.join(out_dir, "adj_recon.nii.gz"), "data-adj-recon"),
+        ("adj_recon_aligned.nii.gz", os.path.join(out_dir, "adj_recon_aligned.nii.gz"), "data-adj-aligned"),
+    ])
     print("[adj-test] Done.")
 
 
