@@ -11,13 +11,13 @@ Writes : <out_dir>/b0map/B0_map.npy   (= B0_map_pk.npy)
          <out_dir>/b0map/fig_02*.png   (when --save-plots)
 
 Usage:
-    python scripts/02_B0_map_estimation.py \
-        --data-dir  ./data/ \
+    python scripts/data_preproc/data_proc_03_B0_map_estimation.py \
+        --data-dir  data/processed/invivo_250305_01 \
         --basis-dir ./basis/ \
-        --out-dir   ./output \
         --dim 64 64 --n-seq-points 300 --k-points 39842 \
         --save-plots \
         --phase-method max-real
+        [--brain-threshold 0.16]
 """
 
 import argparse
@@ -27,11 +27,17 @@ import sys
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+plt.style.use("dark_background")
+plt.rcParams["axes.prop_cycle"] = plt.cycler(color=[
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+])
 from matplotlib.patches import Rectangle
 import numpy as np
 from scipy.ndimage import binary_erosion, gaussian_filter, distance_transform_edt
 from warnings import filterwarnings
 filterwarnings("ignore")
+import nibabel as nib
 
 import mrinufft
 from fsl_mrs.utils.misc import FIDToSpec, SpecToFID
@@ -39,25 +45,34 @@ from fsl_mrs.core.nifti_mrs import gen_nifti_mrs
 from fsl_mrs.core.mrs import MRS, Basis
 from fsl.data.image import Image
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from utils.scan_params import load_scan_params
 from utils.utils import phase_corr
+from utils.pipeline_utils import try_symlink_shared_output, make_brain_mask, patch_spicefit_tree
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="B0 map estimation — step 2")
     p.add_argument("--data-dir",        required=True)
     p.add_argument("--basis-dir",       required=True)
-    p.add_argument("--out-dir",         default="./output")
-    p.add_argument("--dwelltime",       type=float, default=5e-6)
-    p.add_argument("--k-points",        type=int,   default=39842)
+    p.add_argument("--out-dir",         default=None,
+                   help="Output directory (default: ./output/<subject_id> derived from --data-dir)")
+    p.add_argument("--dwelltime",       type=float, default=None)
+    p.add_argument("--k-points",        type=int, default=None)
     p.add_argument("--n-seq-points",    type=int,   default=300)
-    p.add_argument("--n-coils",         type=int,   default=32)
+    p.add_argument("--n-coils",         type=int, default=None)
     p.add_argument("--dim",             type=int,   nargs=2, default=[64, 64], metavar=("NX", "NY"))
-    p.add_argument("--center-freq",     type=float, default=297.219338)
+    p.add_argument("--center-freq",     type=float, default=None)
     p.add_argument("--ppm-center",      type=float, default=3.027)
     p.add_argument("--ksp-scale",       type=float, default=None)
-    p.add_argument("--brain-threshold", type=float, default=0.002)
+    p.add_argument("--brain-threshold", type=float, default=0.07,
+                   help="Normalized wref_o threshold for brain mask (default 0.07)")
     p.add_argument("--brain-erosion",   type=int,   default=3)
+    p.add_argument("--brain-mask-cleanup", action="store_true",
+                   help="Extra cleanup pass on the thresholded brain mask: keep only the "
+                        "largest connected component (drops disconnected noise blobs outside "
+                        "the brain) and fill enclosed holes (e.g. a central signal void). "
+                        "Default: off, use only if a single global threshold isn't enough.")
     p.add_argument("--phase-ppmlim",    type=float, nargs=2, default=[0.0, 7.0], metavar=("LO", "HI"))
     p.add_argument("--phase-method",    type=str,   default=None,
                    help="Phase correction method passed to fsl_mrs: 'max-real' or 'phasta' (default: None = fsl_mrs default)")
@@ -131,6 +146,13 @@ def make_singlet_fid(PPM_CENTER, center_freq, TIME_AXIS, linewidth_hz=5.0):
 def main():
     args     = parse_args()
     data_dir = args.data_dir.rstrip("/") + "/"
+    if args.out_dir is None:
+        args.out_dir = os.path.join("./output", os.path.basename(args.data_dir.rstrip("/")))
+    load_scan_params(args, data_dir, k_key="k_wref")
+
+    if try_symlink_shared_output(data_dir, args.out_dir, "b0map"):
+        return
+
     out_dir  = os.path.join(args.out_dir, "b0map")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -194,15 +216,25 @@ def main():
     mag_map_2d = np.mean(np.abs(image_blurry_numpy), axis=-1)
 
     # ── Cell 7: save wref NIfTI ───────────────────────────────────────────────────
-    ref_img_path = args.ref_nii or (data_dir + "meas_MID00125_FID81014_mrsi_64_cr_adj300.nii.gz")
-    try:
-        ref_img_obj = Image(ref_img_path)
+    _wref_affine_npy = data_dir + "wref_affine.npy"
+    if args.ref_nii:
+        ref_img_obj = Image(args.ref_nii)
         affine      = ref_img_obj.voxToWorldMat
-    except Exception:
+    elif os.path.exists(_wref_affine_npy):
+        affine      = np.load(_wref_affine_npy)
         ref_img_obj = None
-        affine      = np.eye(4)
+        print(f"[b0_corr] Loaded wref affine from {_wref_affine_npy}")
+    else:
+        ref_img_path = data_dir + "meas_MID00125_FID81014_mrsi_64_cr_adj300.nii.gz"
+        try:
+            ref_img_obj = Image(ref_img_path)
+            affine      = ref_img_obj.voxToWorldMat
+        except Exception:
+            ref_img_obj = None
+            affine      = np.eye(4)
+            print("[b0_corr] WARNING: wref_affine.npy not found; using identity")
 
-    fid_save = SpecToFID(image_blurry_numpy.reshape(Ny, Nx, -1), axis=-1).transpose(1, 0, 2)
+    fid_save = np.ascontiguousarray(SpecToFID(image_blurry_numpy.reshape(Ny, Nx, -1), axis=-1).transpose(1, 0, 2)[::-1, :, :])
     gen_nifti_mrs(fid_save[:, :, np.newaxis, :], dwelltime=TS, spec_freq=297.219,
                   affine=affine).save(os.path.join(out_dir, "wref_adj_nufft.nii.gz"))
     print("[b0_corr] Saved wref_adj_nufft.nii.gz")
@@ -215,15 +247,17 @@ def main():
                               os.path.join(out_dir, "fig_02a_adjnufft_raw.png"))
         print("[b0_corr] Saved fig_02a_adjnufft_raw.png")
 
-    # ── Cell 9: brain mask ────────────────────────────────────────────────────────
-    brain_mask       = mag_map_2d > args.brain_threshold
-    brain_mask_inner = binary_erosion(brain_mask, iterations=args.brain_erosion)
+    # ── Cell 9: brain mask (normalised wref_o) ───────────────────────────────────
+    wref_o_img  = np.load(data_dir + "wref_o.npy", mmap_mode="r")
+    wref_norm, brain_mask, brain_mask_inner = make_brain_mask(
+        wref_o_img, args.brain_threshold, args.brain_erosion,
+        cleanup=args.brain_mask_cleanup)
 
     if args.save_plots:
         fig, ax = plt.subplots(figsize=(6, 5))
-        im = ax.imshow(np.abs(mag_map_2d), origin="lower", cmap="gray")
+        im = ax.imshow(wref_norm, origin="lower", cmap="gray")
         ax.imshow(brain_mask, origin="lower", cmap="Reds", alpha=0.35)
-        ax.set_title(f"Magnitude + brain mask (thr={args.brain_threshold:.3g})")
+        ax.set_title(f"wref_o (norm) + brain mask (thr={args.brain_threshold:.3g})")
         plt.colorbar(im, ax=ax)
         plt.tight_layout()
         fig.savefig(os.path.join(out_dir, "fig_02b_brain_mask.png"), dpi=120)
@@ -250,6 +284,7 @@ def main():
             ref_img    = ref_img_obj,
             out_fname  = "wref_phcorr_nifti",
             method     = phase_method,
+            affine     = affine,
         )
     # wref_phcorr_f: (Ny, Nx, T) — conjugated phase-corrected FID (matches notebook)
     wref_phcorr = FIDToSpec(np.array(wref_phcorr_f), axis=-1)   # spectrum for plotting
@@ -298,7 +333,7 @@ def main():
 
     if args.save_plots:
         fig, ax = plt.subplots(figsize=(6, 5))
-        im = ax.imshow(b0_shift_hz_img, origin="lower")
+        im = ax.imshow(b0_shift_hz_img, origin="lower", cmap="gray")
         plt.colorbar(im, ax=ax, label="B0 offset (Hz)")
         ax.set_title("B0 shift (Hz) — raw fit")
         plt.tight_layout()
@@ -313,7 +348,7 @@ def main():
         B0_fill_smoothed[~brain_mask] = np.nan
         if args.save_plots:
             fig, ax = plt.subplots(figsize=(6, 5))
-            im = ax.imshow(B0_fill_smoothed, origin="lower")
+            im = ax.imshow(B0_fill_smoothed, origin="lower", cmap="gray")
             plt.colorbar(im, ax=ax, label="B0 offset smoothed (Hz)")
             ax.set_title(f"B0 map smoothed  σ={args.smooth_sigma}")
             plt.tight_layout()
@@ -334,12 +369,17 @@ def main():
     B0_final = B0_fill_smoothed
     np.save(os.path.join(out_dir, "B0_map_pk.npy"), B0_final)
     np.save(os.path.join(out_dir, "B0_map.npy"),    B0_final)
-    print(f"[b0_corr] Saved B0_map.npy  "
+    b0_nii = nib.Nifti1Image(
+        np.ascontiguousarray(B0_final.T[::-1, :])[:, :, np.newaxis].astype(np.float32),
+        affine)
+    b0_nii.header.set_xyzt_units("mm")
+    nib.save(b0_nii, os.path.join(out_dir, "B0_map.nii.gz"))
+    print(f"[b0_corr] Saved B0_map.npy / B0_map.nii.gz  "
           f"range=[{np.nanmin(B0_final):.2f}, {np.nanmax(B0_final):.2f}] Hz")
 
     if args.save_plots:
         fig, ax = plt.subplots(figsize=(6, 5))
-        im = ax.imshow(B0_final, origin="lower")
+        im = ax.imshow(B0_final, origin="lower", cmap="gray")
         plt.colorbar(im, ax=ax, label="B0 offset (Hz)")
         ax.set_title("B0 map — final")
         plt.tight_layout()
@@ -351,6 +391,11 @@ def main():
     np.save(os.path.join(out_dir, "wref_resampled.npy"), image_blurry_numpy)
     print(f"[b0_corr] Saved wref_resampled.npy  shape={image_blurry_numpy.shape}")
 
+    patch_spicefit_tree(args.out_dir, [
+        ("wref_adj_nufft.nii.gz", os.path.join(out_dir, "wref_adj_nufft.nii.gz"), "data-wref"),
+        ("b0_map.nii.gz",      os.path.join(out_dir, "B0_map.nii.gz"),            "data-b0-map"),
+        ("wref_phcorr.nii.gz", os.path.join(out_dir, "wref_phcorr_nifti.nii.gz"), "data-wref-phcorr"),
+    ])
     print("[b0_corr] Done.")
 
 

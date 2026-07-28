@@ -12,16 +12,16 @@ Supports two modes matching step 09:
   lobpcg      Samples from LOBPCG eigenpairs (step 10).  Perturbations from
               CN(0, H^{-1}) are added to the mean SPICE estimate.
 
-Reads  : <out_dir>/spice/SPICE_f.npy
-         <out_dir>/spice/V_subspace.npy
-         <out_dir>/spice/U_est.npy
+Reads  : <out_dir>/spice_<run_tag>/SPICE_f.npy        (tag e.g. w5000_l0.0001)
+         <out_dir>/spice_<run_tag>/V_subspace.npy
+         <out_dir>/spice_<run_tag>/U_est.npy
          <data_dir>/wref_o.npy
-         [voxelwise] <hess_dir>/mHm_*.npy  +  <data_dir>/sigma_noise.npy
-         [lobpcg]    <lobpcg_dir>/lobpcg_Q.npy  <lobpcg_dir>/lobpcg_vals.npy
+         [voxelwise] <out_dir>/hessian_<run_tag>/mHm_*.npy  +  <data_dir>/sigma_noise.npy
+         [lobpcg]    <out_dir>/lobpcg_<run_tag>/lobpcg_Q.npy  lobpcg_vals.npy
          <basis_dir>/            (training basis for xcorr reference)
          <fit_basis_dir>/        (FSL-MRS fitting basis)
 
-Writes : <out_dir>/conc_uncertainty/
+Writes : <out_dir>/conc_uncertainty_<run_tag>/
              mc_{i:04d}_phcorr.nii.gz      (xcorr-aligned sample NIfTI-MRS)
              mc_{i:04d}_fit.nii.gz/         (fsl_mrsi output directory)
              output_concs.npy               (N_success, Ny, Nx, n_metab)
@@ -31,24 +31,21 @@ Writes : <out_dir>/conc_uncertainty/
              fig_11_conc_std_<metab>.png
 
 Usage:
-    # lobpcg mode (default — faster)
-    python scripts/12_MC_conc_uncertainty.py \
-        --data-dir      ./data/ \
-        --basis-dir     ./basis/ \
-        --fit-basis-dir ./basis_fit/ \
-        --out-dir       ./output \
-        --lobpcg-dir    ./output/lobpcg \
-        --mode lobpcg --rank 20 --n-samples 20 \
+    # voxelwise mode (default)
+    python scripts/uncertainty/MC/Uncert_05_MC_conc_uncertainty.py \
+        --data-dir  data/processed/invivo_250305_01 \
+        --basis-dir ./basis/ \
+        --run-tag   w5000_l0.0001 \
+        --rank 20 --n-samples 20 \
         --combine NAA NAAG --combine PCh GPC --combine Cr PCr \
         --plot-metabs NAA Cr Ins Glu PCh
 
-    # voxelwise mode
-    python scripts/12_MC_conc_uncertainty.py \
-        --data-dir  ./data/ \
+    # lobpcg mode (faster)
+    python scripts/uncertainty/MC/Uncert_05_MC_conc_uncertainty.py \
+        --data-dir  data/processed/invivo_250305_01 \
         --basis-dir ./basis/ \
-        --out-dir   ./output \
-        --hess-dir  ./output/hessian \
-        --mode voxelwise --rank 20 --n-samples 20
+        --run-tag   w5000_l0.0001 \
+        --mode lobpcg --rank 20 --n-samples 20
 """
 
 import argparse
@@ -74,8 +71,9 @@ from fsl_mrs.utils.synthetic import syntheticFromBasisFile
 from fsl_mrs.core.nifti_mrs import gen_nifti_mrs, NIFTI_MRS
 from fsl.data.image import Image
 
-_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 sys.path.insert(0, _root)
+from utils.scan_params import load_scan_params
 
 from utils.xcorr import my_mrsi_freq_align
 
@@ -281,14 +279,15 @@ def _plot_mean_map(name, conc_mean, metab_names, wref_norm, brain_mask, out_path
 
 def parse_args():
     p = argparse.ArgumentParser(description="Laplacian MC concentration uncertainty — step 11")
-    p.add_argument("--mode",            choices=["voxelwise", "lobpcg"], default="lobpcg",
+    p.add_argument("--mode",            choices=["voxelwise", "lobpcg"], default="voxelwise",
                    help="Source of posterior samples (matches step 09 --mode)")
     p.add_argument("--data-dir",        required=True)
     p.add_argument("--basis-dir",       required=True,
                    help="Training basis dir (for xcorr reference, same as step 04/05)")
     p.add_argument("--fit-basis-dir",   default=None,
                    help="Fitting basis for fsl_mrsi (defaults to --basis-dir)")
-    p.add_argument("--out-dir",         default="./output")
+    p.add_argument("--out-dir",         default=None,
+                   help="Output directory (default: ./output/<subject_id> derived from --data-dir)")
     p.add_argument("--hess-dir",        default=None,
                    help="[voxelwise] mHm_*.npy directory (default: <out-dir>/hessian)")
     p.add_argument("--lobpcg-dir",      default=None,
@@ -298,10 +297,10 @@ def parse_args():
     p.add_argument("--ref-nii",         default=None,
                    help="Reference NIfTI for affine (optional)")
     # Acquisition params (must match step 04/05)
-    p.add_argument("--dwelltime",       type=float, default=5e-6)
-    p.add_argument("--k-points",        type=int,   default=39842)
+    p.add_argument("--dwelltime",       type=float, default=None)
+    p.add_argument("--k-points",        type=int, default=None)
     p.add_argument("--n-seq-points",    type=int,   default=300)
-    p.add_argument("--center-freq",     type=float, default=297.219338)
+    p.add_argument("--center-freq",     type=float, default=None)
     p.add_argument("--ppm-center",      type=float, default=3.027)
     p.add_argument("--dim",             type=int,   nargs=2, default=[64, 64],
                    metavar=("NY", "NX"))
@@ -327,6 +326,9 @@ def parse_args():
                    default=["NAA", "NAA+NAAG", "Cr", "Cr+PCr", "Ins", "Glu", "PCh"])
     p.add_argument("--cleanup",         action="store_true",
                    help="Delete intermediate per-sample NIfTI and fit dirs after collecting")
+    p.add_argument("--run-tag",         default="",
+                   help="Run identifier from recon_01 (e.g. w5000_l0.0001); "
+                        "appended to spice/fitting/conc_uncertainty subdir names")
     return p.parse_args()
 
 
@@ -335,8 +337,12 @@ def parse_args():
 def main():
     args = parse_args()
     data_dir      = args.data_dir.rstrip("/") + "/"
-    spice_dir     = os.path.join(args.out_dir, "spice")
-    out_dir       = os.path.join(args.out_dir, "conc_uncertainty")
+    if args.out_dir is None:
+        args.out_dir = os.path.join("./output", os.path.basename(args.data_dir.rstrip("/")))
+    load_scan_params(args, data_dir, k_key="k_mrsi")
+    _tg           = lambda b: f"{b}_{args.run_tag}" if args.run_tag else b
+    spice_dir     = os.path.join(args.out_dir, _tg("spice"))
+    out_dir       = os.path.join(args.out_dir, _tg("conc_uncertainty"))
     fit_basis_dir = args.fit_basis_dir or args.basis_dir
     os.makedirs(out_dir, exist_ok=True)
 
@@ -360,13 +366,19 @@ def main():
     mean_U = est_U[:N_VOXEL, :args.rank].astype(D_TYPE)         # (N_vox, rank)
 
     # ── Reference affine ─────────────────────────────────────────────────────
-    ref_nii_path = args.ref_nii or (data_dir + "meas_MID00125_FID81014_mrsi_64_cr_adj300.nii.gz")
-    try:
-        ref_img = Image(ref_nii_path)
-        affine  = ref_img.voxToWorldMat
-    except Exception:
-        ref_img = None
-        affine  = np.eye(4)
+    _affine_npy = data_dir + "affine.npy"
+    if args.ref_nii:
+        affine = Image(args.ref_nii).voxToWorldMat
+    elif os.path.exists(_affine_npy):
+        affine = np.load(_affine_npy)
+        print(f"[mc-fit] Loaded affine from {_affine_npy}")
+    else:
+        ref_nii_path = data_dir + "meas_MID00125_FID81014_mrsi_64_cr_adj300.nii.gz"
+        try:
+            affine = Image(ref_nii_path).voxToWorldMat
+        except Exception:
+            affine = np.eye(4)
+            print("[mc-fit] WARNING: affine.npy not found; using identity")
 
     # ── Build xcorr reference (basis_nmrs) ───────────────────────────────────
     print("[mc-fit] Building xcorr reference basis …")
@@ -383,15 +395,18 @@ def main():
 
     # ── Save brain mask NIfTI for fsl_mrsi ───────────────────────────────────
     mask_nii = os.path.join(out_dir, "brain_mask.nii.gz")
-    Image((wref_2d * brain_mask).astype(np.float32).T).save(mask_nii)
+    mask_data = np.ascontiguousarray((wref_2d * brain_mask).astype(np.float32).T[::-1, :])
+    mask_nii_obj = nib.Nifti1Image(mask_data[:, :, np.newaxis], affine)
+    mask_nii_obj.header.set_xyzt_units("mm")
+    nib.save(mask_nii_obj, mask_nii)
 
     # ── Generate all posterior samples ───────────────────────────────────────
     rng = np.random.default_rng(args.seed)
 
     if args.mode == "voxelwise":
-        hess_dir    = args.hess_dir or os.path.join(args.out_dir, "hessian")
+        hess_dir    = args.hess_dir or os.path.join(args.out_dir, _tg("hessian"))
         sigma_noise = float(np.load(data_dir + "sigma_noise.npy"))
-        cov_scale   = sigma_noise ** 2
+        cov_scale   = 2.0 * sigma_noise ** 2  # σ_complex² = 2σ_real²; sigma_noise stores σ_real
         mu_map      = (mean_U @ V.conj().T).astype(D_TYPE)      # (N_vox, N_seq)
         print(f"[mc-fit] voxelwise  sigma_noise={sigma_noise:.3e}  cov_scale={cov_scale:.3e}")
         all_samples = build_voxelwise_samples(
@@ -399,7 +414,7 @@ def main():
         )   # (n_samples, N_voxel, N_seq) FID
 
     else:  # lobpcg
-        lobpcg_dir = args.lobpcg_dir or os.path.join(args.out_dir, "lobpcg")
+        lobpcg_dir = args.lobpcg_dir or os.path.join(args.out_dir, _tg("lobpcg"))
         Q    = np.load(os.path.join(lobpcg_dir, "lobpcg_Q.npy"))
         vals = np.load(os.path.join(lobpcg_dir, "lobpcg_vals.npy"))
         print(f"[mc-fit] lobpcg  Q={Q.shape}  vals={vals.shape}  sigma2={args.sigma2}")
@@ -416,11 +431,11 @@ def main():
     # xcorr-aligned perturbed FID.  We correct each MC sample so its c_raw is in
     # the same units as the original fit's c_raw (i.e. c_fit / s_j).
     if args.rescale:
-        _orig_nii      = NIFTI_MRS(os.path.join(args.out_dir, "fitting", "spice_aligned.nii.gz"))
+        _orig_nii      = NIFTI_MRS(os.path.join(spice_dir, "SPICE_phcorr.nii.gz"))
         _orig_fid_data = np.array(_orig_nii.image[:, :, 0, :])      # (Nx, Ny, N_seq)
         orig_scale_map = np.max(np.abs(_orig_fid_data), axis=-1)    # (Nx, Ny)
         orig_scale_map = np.where(orig_scale_map > 0, orig_scale_map, 1.0)
-        print(f"[mc-fit] Loaded orig_scale from spice_aligned.nii.gz, "
+        print(f"[mc-fit] Loaded orig_scale from SPICE_phcorr.nii.gz, "
               f"mean={orig_scale_map.mean():.3e}  max={orig_scale_map.max():.3e}")
 
     combine_groups = args.combine if args.combine else [["NAA", "NAAG"]]
@@ -536,6 +551,38 @@ def main():
     np.save(os.path.join(out_dir, "metab_names.npy"),   np.array(metab_names_ref))
     print(f"[mc-fit] Saved output_concs shape={output_concs_arr.shape}")
     print(f"[mc-fit] Saved conc_std shape={conc_std.shape}")
+
+    # ── Save NIfTI + symlink into spice_fit/uncertainties/ for FSLeyes ───────
+    spice_fit_dir  = Path(args.out_dir) / _tg("fitting") / "spice_fit"
+    fit_uncert_dir = spice_fit_dir / "uncertainties"
+    if fit_uncert_dir.exists():
+        _ref_conc = spice_fit_dir / "concs" / "raw" / f"{metab_names_ref[0]}.nii.gz"
+        _nii_aff  = nib.load(str(_ref_conc)).affine if _ref_conc.exists() else np.eye(4)
+
+        def _save_and_link_mc(arr_ny_nx, name):
+            nii_data = np.ascontiguousarray(arr_ny_nx.T[::-1, :]).astype(np.float32)
+            nii_path = os.path.join(out_dir, f"mc_{name}_sd.nii.gz")
+            nib.save(nib.Nifti1Image(nii_data[:, :, np.newaxis], _nii_aff), nii_path)
+            dst = fit_uncert_dir / f"mc_{name}_sd.nii.gz"
+            if dst.is_symlink() or dst.exists():
+                dst.unlink()
+            dst.symlink_to(os.path.abspath(nii_path))
+
+        for k_idx, name in enumerate(metab_names_ref):
+            _save_and_link_mc(conc_std[:, :, k_idx], name)
+        print(f"[mc-fit] Saved + symlinked mc_*_sd.nii.gz → {fit_uncert_dir}")
+
+        tree_path = spice_fit_dir / "mrsi.tree"
+        if tree_path.exists():
+            tree_txt = tree_path.read_text()
+            entry = "    mc_{metab}_sd.nii.gz                    (mc-sd)\n"
+            if "mc_{metab}_sd.nii.gz" not in tree_txt:
+                tree_txt = tree_txt.replace(
+                    "    {metab}_sd.nii.gz                       (sd)\n",
+                    "    {metab}_sd.nii.gz                       (sd)\n" + entry,
+                )
+                tree_path.write_text(tree_txt)
+                print(f"[mc-fit] Patched mrsi.tree with mc-sd entry")
 
     # ── Plot ──────────────────────────────────────────────────────────────────
     for meta in plot_metabs:

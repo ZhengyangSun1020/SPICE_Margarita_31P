@@ -6,6 +6,9 @@ outputs/
 save_iter*/
 saved_iters*/
 
+# Review notebook data — too large for version control
+review_vulcan_mc_*/data/
+
 # Notebooks (keep locally, do not publish)
 notebooks/
 
@@ -34,10 +37,18 @@ build/
 *.swo
 *~
 
+# Visualization folder (scripts + outputs, kept local only)
+viz/
+
+# Scratch / one-off sweep scripts (kept local only)
+tmp/
+
 # Experimental / work-in-progress scripts (kept local only)
-scripts/04b_SPICE_refit.py
-scripts/04c_SPICE_uoss_refit.py
-scripts/04d_SPICE_lam20_refit.py
+scripts/recon_method/04b_SPICE_refit.py
+scripts/recon_method/04c_SPICE_uoss_refit.py
+scripts/recon_method/04d_SPICE_lam20_refit.py
+scripts/uncertainty/analytical/08b_Laplacian_Covariance_joint.py
+scripts/uncertainty/analytical/Uncert_00_cleanup_hessian.py
 
 # HPC submission scripts
 *.sh
@@ -45,3 +56,6 @@ scripts/04d_SPICE_lam20_refit.py
 # Temporary / intermediate files
 *.tmp
 *.log
+
+# Large training data — distribute manually
+basis/SS_training.csv

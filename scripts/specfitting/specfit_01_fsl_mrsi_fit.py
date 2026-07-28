@@ -2,24 +2,23 @@
 """
 Step 7 — Spectral fitting of SPICE reconstruction.
 
-Reads  : <out_dir>/spice/SPICE_f.npy             (raw SPICE FID from step 04, default)
-         OR --spice-npy <path>                   (e.g. spice_refit_uoss/SPICE_refit_f.npy from 04c)
-         <data_dir>/wref_o.npy                   (water reference for brain mask)
-         <fit-basis-dir>/                         (FSL-MRS fitting basis)
-Writes : <out_dir>/fitting/spice_aligned.nii.gz  (xcorr freq-aligned NIfTI-MRS)
-         <out_dir>/fitting/brain_mask.nii.gz
-         <out_dir>/fitting/spice_fit/              (fsl_mrsi output directory)
-         <out_dir>/fitting/conc_maps.npy
-         <out_dir>/fitting/fig_05_*.png
+Reads  : <out_dir>/spice_<run_tag>/SPICE_phcorr.nii.gz  (xcorr-aligned output from recon_01)
+         OR --spice-phcorr <path>                        (explicit override)
+         <data_dir>/wref_o.npy                           (water reference for brain mask)
+         <fit-basis-dir>/                                (FSL-MRS fitting basis)
+Writes : <out_dir>/fitting_<run_tag>/brain_mask.nii.gz
+         <out_dir>/fitting_<run_tag>/spice_fit/   (fsl_mrsi output directory)
+         <out_dir>/fitting_<run_tag>/conc_maps.npy
+         <out_dir>/fitting_<run_tag>/fig_05_*.png
 
 Usage:
-    python scripts/07_spectral_fitting.py \
-        --data-dir      ./data/ \
+    python scripts/specfitting/specfit_01_fsl_mrsi_fit.py \
+        --data-dir      data/processed/invivo_250305_01 \
         --basis-dir     ./basis/ \
-        --out-dir       ./output \
-        --spice-npy     ./output/spice_refit_uoss/SPICE_refit_f.npy \
+        --run-tag       w5000_l0.0001 \
         --dim 64 64 \
         --combine NAA NAAG --combine PCh GPC --combine Cr PCr \
+        --rescale --brain-erosion 2 --brain-threshold 0.16 \
         [--plot-metabs NAA Cr Ins Glu PCh]
         [--ppmlim 0.0 7.5]
 """
@@ -41,17 +40,15 @@ from scipy.ndimage import binary_erosion
 from warnings import filterwarnings
 filterwarnings("ignore")
 
-from fsl_mrs.utils import mrs_io
 from fsl_mrs.utils.misc import FIDToSpec
-from fsl_mrs.utils.synthetic import syntheticFromBasisFile
-from fsl_mrs.core.nifti_mrs import gen_nifti_mrs
+from fsl_mrs.core.nifti_mrs import NIFTI_MRS as NIFTI_MRS_fsl
 from fsl.data.image import Image
 
-# project root → utils package + xcorr
-_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# project root → utils package
+_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _root)
+from utils.scan_params import load_scan_params
 
-from utils.xcorr import my_mrsi_freq_align
 from utils.utils import plot_voxel_spectrum_and_maps
 
 
@@ -78,7 +75,7 @@ def load_concentration_maps(fit_dir):
             data = data[:, :, 0]
         if data.ndim != 2:
             raise ValueError(f"{f.name}: expected 2-D after squeeze, got {data.shape}")
-        conc_maps[name] = data.T
+        conc_maps[name] = data.T[:, ::-1]
     return conc_maps
 
 
@@ -88,14 +85,23 @@ def plot_metab_map(name, conc_maps, out_path, brain_mask=None,
         print(f"[warn] '{name}' not in conc_maps, skipping.")
         return
 
-    arr = conc_maps[name]
+    raw = conc_maps[name]
+    arr = np.where(brain_mask, raw, np.nan) if brain_mask is not None else raw
+
+    import copy
+    _cmap = copy.copy(plt.cm.get_cmap(cmap))
+    _cmap.set_bad(color="black")
+
     fig, ax = plt.subplots(figsize=(6, 5), facecolor="black")
     ax.set_facecolor("black")
 
     if wref_img_2d is not None:
-        ax.imshow(wref_img_2d, origin="lower", cmap="gray", alpha=0.6, zorder=0)
+        _gray = copy.copy(plt.cm.get_cmap("gray"))
+        _gray.set_bad(color="black")
+        wref_masked = np.where(brain_mask, wref_img_2d, np.nan) if brain_mask is not None else wref_img_2d
+        ax.imshow(wref_masked, origin="lower", cmap=_gray, alpha=0.6, zorder=0)
 
-    im = ax.imshow(arr, origin="lower", vmin=vmin, vmax=vmax, cmap=cmap,
+    im = ax.imshow(arr, origin="lower", vmin=vmin, vmax=vmax, cmap=_cmap,
                    alpha=0.9 if wref_img_2d is not None else 1.0, zorder=1)
 
     ax.set_title(f"Concentration: {name}", color="white")
@@ -111,9 +117,6 @@ def plot_metab_map(name, conc_maps, out_path, brain_mask=None,
     )
     plt.setp(cbar.ax.get_yticklabels(), color="white")
 
-    if brain_mask is not None:
-        ax.contour(brain_mask, levels=[0.5], colors="white", linewidths=0.7, zorder=2)
-
     plt.tight_layout()
     fig.savefig(out_path, dpi=150, facecolor="black")
     plt.close(fig)
@@ -126,21 +129,21 @@ def parse_args():
     p.add_argument("--data-dir",         required=True,
                    help="Scan data directory (contains wref_o.npy)")
     p.add_argument("--basis-dir",        required=True,
-                   help="Training basis dir (same as step 04; used to build basis_nmrs for xcorr)")
+                   help="Training basis dir (same as recon_01; also used as fit basis if --fit-basis-dir not set)")
     p.add_argument("--fit-basis-dir",    default=None,
                    help="Fitting basis directory for fsl_mrsi (defaults to --basis-dir)")
-    p.add_argument("--out-dir",          default="./output")
-    p.add_argument("--spice-npy",        default=None,
-                   help="Path to SPICE FID .npy (overrides default "
-                        "<out_dir>/spice/SPICE_f.npy; use for 04c output: "
-                        "<out_dir>/spice_refit_uoss/SPICE_refit_f.npy)")
+    p.add_argument("--out-dir",          default=None,
+                   help="Output directory (default: ./output/<subject_id> derived from --data-dir)")
+    p.add_argument("--spice-phcorr",     default=None,
+                   help="Path to SPICE_phcorr.nii.gz (overrides default "
+                        "<out_dir>/spice_<run_tag>/SPICE_phcorr.nii.gz)")
     p.add_argument("--ref-nii",          default=None,
                    help="Reference NIfTI for affine (optional)")
     # Spectral / acquisition (must match step 04)
-    p.add_argument("--dwelltime",        type=float, default=5e-6)
-    p.add_argument("--k-points",         type=int,   default=39842)
+    p.add_argument("--dwelltime",        type=float, default=None)
+    p.add_argument("--k-points",         type=int, default=None)
     p.add_argument("--n-seq-points",     type=int,   default=300)
-    p.add_argument("--center-freq",      type=float, default=297.219338)
+    p.add_argument("--center-freq",      type=float, default=None)
     p.add_argument("--ppm-center",       type=float, default=3.027)
     p.add_argument("--dim",              type=int,   nargs=2, default=[64, 64],
                    metavar=("NY", "NX"))
@@ -164,6 +167,9 @@ def parse_args():
                    default=["NAA","NAA+NAAG", "Cr","Cr+PCr", "Ins", "Glu", "PCh","PCh+GPC"])
     p.add_argument("--voxel-x",          type=int, default=32)
     p.add_argument("--voxel-y",          type=int, default=32)
+    p.add_argument("--run-tag",          default="",
+                   help="Run identifier from recon_01 (e.g. w5000_l0.0001); "
+                        "appended to spice/fitting subdir names")
     return p.parse_args()
 
 
@@ -173,8 +179,12 @@ def main():
     args = parse_args()
 
     data_dir      = args.data_dir.rstrip("/") + "/"
-    spice_dir     = os.path.join(args.out_dir, "spice")
-    fit_dir       = os.path.join(args.out_dir, "fitting")
+    if args.out_dir is None:
+        args.out_dir = os.path.join("./output", os.path.basename(args.data_dir.rstrip("/")))
+    load_scan_params(args, data_dir, k_key="k_mrsi")
+    _tg           = lambda b: f"{b}_{args.run_tag}" if args.run_tag else b
+    spice_dir     = os.path.join(args.out_dir, _tg("spice"))
+    fit_dir       = os.path.join(args.out_dir, _tg("fitting"))
     fit_basis_dir = args.fit_basis_dir or args.basis_dir
     os.makedirs(fit_dir, exist_ok=True)
 
@@ -188,24 +198,33 @@ def main():
     PPM_AXIS    = FREQ_AXIS / center_freq + PPM_CENTER
 
     # ── Reference NIfTI affine ────────────────────────────────────────────────
-    ref_nii_path = args.ref_nii or (data_dir + "meas_MID00125_FID81014_mrsi_64_cr_adj300.nii.gz")
-    try:
-        ref_img = Image(ref_nii_path)
-        affine  = ref_img.voxToWorldMat
-    except Exception:
-        ref_img = None
-        affine  = np.eye(4)
+    # Priority: (1) --ref-nii arg, (2) affine.npy saved by data_proc_01_twix2npy,
+    #           (3) fallback to identity
+    _affine_npy = data_dir + "affine.npy"
+    if args.ref_nii:
+        affine = Image(args.ref_nii).voxToWorldMat
+    elif os.path.exists(_affine_npy):
+        affine = np.load(_affine_npy)
+        print(f"[fitting] Loaded affine from {_affine_npy}")
+    else:
+        ref_nii_path = data_dir + "meas_MID00125_FID81014_mrsi_64_cr_adj300.nii.gz"
+        try:
+            affine = Image(ref_nii_path).voxToWorldMat
+        except Exception:
+            affine = np.eye(4)
+            print("[fitting] WARNING: affine.npy not found; using identity — run data_proc_01_twix2npy")
 
-    # ── Load raw SPICE FID ────────────────────────────────────────────────────
-    spice_f_path = args.spice_npy or os.path.join(spice_dir, "SPICE_f.npy")
-    if not os.path.exists(spice_f_path):
+    # ── Load SPICE_phcorr (xcorr-aligned output from recon_01) ───────────────
+    phcorr_path = args.spice_phcorr or os.path.join(spice_dir, "SPICE_phcorr.nii.gz")
+    if not os.path.exists(phcorr_path):
         raise FileNotFoundError(
-            f"SPICE FID not found at {spice_f_path}\n"
-            "Run step 04 (04_run_spice.py) or pass --spice-npy to a 04c output."
+            f"SPICE_phcorr not found at {phcorr_path}\n"
+            "Run recon_01 first or pass --spice-phcorr to an alternate path."
         )
-    print(f"[fitting] Loading {spice_f_path} ...")
-    spice_est = np.load(spice_f_path)               # (N_Vox, N_SEQ) or (Ny*Nx, N_SEQ)
-    spice_3d  = spice_est.reshape(Ny, Nx, N_SEQ)    # (Ny, Nx, N_SEQ), FID
+    print(f"[fitting] Loading {phcorr_path} ...")
+    aligned_nmrs = NIFTI_MRS_fsl(phcorr_path)
+    aligned_nii  = phcorr_path
+    aligned_data = np.array(aligned_nmrs.image[:, :, 0, :]).transpose(1, 0, 2)[:, ::-1, :].conj()  # (Ny, Nx, N_SEQ)
 
     # ── Brain mask ────────────────────────────────────────────────────────────
     wref_img  = np.load(data_dir + "wref_o.npy", mmap_mode="r")
@@ -216,66 +235,20 @@ def main():
 
     # save magnitude-weighted mask for fsl_mrsi
     mask_nii = os.path.join(fit_dir, "brain_mask.nii.gz")
-    Image((wref_2d * brain_mask).astype(np.float32).T).save(mask_nii)
+    mask_data = np.ascontiguousarray((wref_2d * brain_mask).astype(np.float32).T[::-1, :])
+    mask_nii_obj = nib.Nifti1Image(mask_data[:, :, np.newaxis], affine)
+    mask_nii_obj.header.set_xyzt_units("mm")
+    nib.save(mask_nii_obj, mask_nii)
     print(f"[fitting] Brain mask saved → {mask_nii}")
 
-    # ── Visualise raw SPICE spectrum ──────────────────────────────────────────
-    _, fig_pre, _ = plot_voxel_spectrum_and_maps(
-        FIDToSpec(spice_3d, axis=-1), (Ny, Nx, N_SEQ),
-        voxel_x=args.voxel_x, voxel_y=args.voxel_y,
-        brain_mask_inner=brain_mask_inner,
-        PPM_AXIS=PPM_AXIS, show=False,
-    )
-    fig_pre.savefig(os.path.join(fit_dir, "fig_05a_spice_raw.png"), dpi=120)
-    plt.close(fig_pre)
-
-    # ── Build basis_nmrs (reference for xcorr) ────────────────────────────────
-    print("[fitting] Building basis_nmrs for xcorr ...")
-    fullbasis = mrs_io.read_basis(args.basis_dir)
-    fid_ref, emptymrs, _ = syntheticFromBasisFile(
-        fullbasis,
-        noisecovariance=[[0]],
-        bandwidth=sweepwidth,
-        points=N_SEQ,
-    )
-    basis_nmrs = gen_nifti_mrs(
-        fid_ref.conj().reshape(1, 1, 1, N_SEQ),
-        dwelltime=emptymrs.dwellTime,
-        spec_freq=emptymrs.centralFrequency,
-        affine=affine,
-    )
-    fig_basis = basis_nmrs.plot(ppmlim=(0, 10))
-    fig_basis.savefig(os.path.join(fit_dir, "fig_05_basis_nmrs.png"), dpi=150)
-    plt.close(fig_basis)
-    print(f"[fitting] basis_nmrs plot saved → {os.path.join(fit_dir, 'fig_05_basis_nmrs.png')}")
-
-    # ── Wrap SPICE FID in NIfTI-MRS ──────────────────────────────────────────
-    # NIfTI-MRS layout: (Nx, Ny, 1, npts)  (x-axis first)
-    mrsi_f_4 = spice_3d.transpose(1, 0, 2)[:, :, np.newaxis, :]
-    nifti_spice = gen_nifti_mrs(
-        mrsi_f_4,
-        dwelltime=TS,
-        spec_freq=297.219,
-        affine=affine,
-    )
-
-    # ── xcorr frequency alignment ─────────────────────────────────────────────
-    print("[fitting] Running xcorr frequency alignment ...")
-    aligned_nmrs, _ = my_mrsi_freq_align(nifti_spice, basis_nmrs)
-
-    aligned_nii = os.path.join(fit_dir, "spice_aligned.nii.gz")
-    aligned_nmrs.save(aligned_nii)
-    print(f"[fitting] Freq-aligned NIfTI saved → {aligned_nii}")
-
-    # Visualise after alignment
-    aligned_data = np.array(aligned_nmrs.image[:, :, 0, :]).transpose(1, 0, 2).conj()  # (Ny, Nx, N_SEQ)
+    # ── Visualise phcorr spectrum ─────────────────────────────────────────────
     _, fig_aln, _ = plot_voxel_spectrum_and_maps(
         FIDToSpec(aligned_data, axis=-1), (Ny, Nx, N_SEQ),
         voxel_x=args.voxel_x, voxel_y=args.voxel_y,
         brain_mask_inner=brain_mask_inner,
         PPM_AXIS=PPM_AXIS, show=False,
     )
-    fig_aln.savefig(os.path.join(fit_dir, "fig_05b_spice_aligned.png"), dpi=120)
+    fig_aln.savefig(os.path.join(fit_dir, "fig_05a_spice_phcorr.png"), dpi=120)
     plt.close(fig_aln)
 
     # ── fsl_mrsi ──────────────────────────────────────────────────────────────
@@ -308,33 +281,88 @@ def main():
     subprocess.run(cmd, env=os.environ.copy(), check=True)
     print(f"[fitting/fsl_mrsi] Done → {fsl_out}")
 
-    # ── Copy U / V / aligned into spice_fit/fit/ for FSLeyes filetree ────────
+    # ── Symlink pipeline outputs into spice_fit/ subfolders for FSLeyes ─────
     fit_subdir = os.path.join(fsl_out, "fit")
-    for fname, src in [
-        ("U_subspace.nii.gz",    os.path.join(spice_dir, "U_subspace.nii.gz")),
-        ("V_subspace.nii.gz",    os.path.join(spice_dir, "V_subspace.nii.gz")),
-        ("spice_aligned.nii.gz", aligned_nii),
-    ]:
-        if os.path.exists(src):
-            shutil.copy2(src, os.path.join(fit_subdir, fname))
-            print(f"[fitting] Copied {fname} → {fit_subdir}")
-        else:
-            print(f"[warn] {src} not found, skipping")
 
-    # ── Patch mrsi.tree: add fit-aligned / fit-U / fit-V entries ─────────────
+    def _symlink(src, dst_name, subdir):
+        """Absolute-path symlink subdir/dst_name → src. No-op if src missing."""
+        if not os.path.exists(src):
+            return False
+        dst = os.path.join(subdir, dst_name)
+        if os.path.islink(dst) or os.path.exists(dst):
+            os.unlink(dst)
+        os.symlink(os.path.abspath(src), dst)
+        print(f"[fitting] Symlinked {dst_name}")
+        return True
+
+    b0map_dir      = os.path.join(args.out_dir, "b0map")
+    lprm_dir_link  = os.path.join(args.out_dir, "lipid_removal")
+    adj_dir        = os.path.join(args.out_dir, "adjoint_test")
+    coilmap_dir    = os.path.join(args.out_dir, "coilmap")
+
+    # Files that go into spice_fit/fit/ (standard 4D NIfTI-MRS only)
+    fit_symlinks = [
+        # (dst_name, src_path, tree_type_label)  — missing src → silently skipped
+        ("spice_aligned.nii.gz",      aligned_nii,                                                "fit-aligned"),
+    ]
+
+    # Files that go into spice_fit/data/ (non-standard dims or pipeline data)
+    data_symlinks = [
+        ("SPICE_result.nii.gz",       os.path.join(spice_dir, "SPICE_result.nii.gz"),             "data-spice-result"),
+        ("adj_recon.nii.gz",          os.path.join(adj_dir,   "adj_recon.nii.gz"),                "data-adj-recon"),
+        ("wref_adj_nufft.nii.gz",     os.path.join(b0map_dir, "wref_adj_nufft.nii.gz"),          "data-wref"),
+        ("my_mrsi_lprm_f.nii.gz",     os.path.join(lprm_dir_link, "my_mrsi_lprm_f.nii.gz"),     "data-lprm-mrsi"),
+        ("U_subspace.nii.gz",         os.path.join(spice_dir, "U_subspace.nii.gz"),               "data-subspace-U"),
+        ("V_subspace.nii.gz",         os.path.join(spice_dir, "V_subspace.nii.gz"),               "data-subspace-V"),
+        ("wref_masked.nii.gz",        os.path.join(spice_dir, "wref_masked.nii.gz"),              "data-wref-masked"),
+        ("adj_recon_aligned.nii.gz",  os.path.join(adj_dir,   "adj_recon_aligned.nii.gz"),        "data-adj-aligned"),
+        ("wref_phcorr.nii.gz",        os.path.join(b0map_dir, "wref_phcorr_nifti.nii.gz"),       "data-wref-phcorr"),
+        ("b0_map.nii.gz",             os.path.join(b0map_dir, "B0_map.nii.gz"),                  "data-b0-map"),
+        ("coilmap.nii.gz",            os.path.join(coilmap_dir, "ecalib_pp.nii.gz"),             "data-coilmap"),
+        ("adj_bf_lprm.nii.gz",        os.path.join(lprm_dir_link, "adj_bf_lprm.nii.gz"),         "data-lprm-bf"),
+        ("adj_bf_crs.nii.gz",         os.path.join(lprm_dir_link, "adj_bf_spice_crs_cr.nii.gz"), "data-lprm-crs"),
+        ("lipid_basis.nii.gz",        os.path.join(lprm_dir_link, "lipid_basis.nii.gz"),          "data-lipid-basis"),
+        ("mrsi_lprm_pre.nii.gz",      os.path.join(lprm_dir_link, "mrsi_lprm_pre_phcorr.nii.gz"), "data-lprm-pre"),
+        ("brain_mask.nii.gz",         os.path.join(fit_dir, "brain_mask.nii.gz"),                "data-brain-mask"),
+    ]
+
+    data_subdir = os.path.join(fsl_out, "data")
+    os.makedirs(data_subdir, exist_ok=True)
+
+    fit_created  = [(n, t) for n, s, t in fit_symlinks  if _symlink(s, n, fit_subdir)]
+    data_created = [(n, t) for n, s, t in data_symlinks if _symlink(s, n, data_subdir)]
+
+    # ── Patch mrsi.tree ───────────────────────────────────────────────────────
     tree_path = os.path.join(fsl_out, "mrsi.tree")
     if os.path.exists(tree_path):
         with open(tree_path) as f:
             tree_txt = f.read()
-        new_entries = (
-            "    spice_aligned.nii.gz                   (fit-aligned)\n"
-            "    U_subspace.nii.gz                      (fit-U)\n"
-            "    V_subspace.nii.gz                      (fit-V)\n"
+
+        # fit/ entries: append into fit section (before data or uncertainties)
+        new_fit = "".join(
+            f"    {name:<38} ({label})\n"
+            for name, label in fit_created
+            if name not in tree_txt
         )
-        tree_txt = tree_txt.replace("uncertainties\n", new_entries + "uncertainties\n")
+        if new_fit:
+            anchor = "data\n" if "data\n" in tree_txt else "uncertainties\n"
+            tree_txt = tree_txt.replace(anchor, new_fit + anchor)
+
+        # data/ entries: append into data section (create section if missing)
+        new_data = "".join(
+            f"    {name:<38} ({label})\n"
+            for name, label in data_created
+            if name not in tree_txt
+        )
+        if new_data:
+            if "data\n" in tree_txt:
+                tree_txt = tree_txt.replace("data\n", "data\n" + new_data)
+            else:
+                tree_txt = tree_txt.replace("uncertainties\n", "data\n" + new_data + "uncertainties\n")
+
         with open(tree_path, "w") as f:
             f.write(tree_txt)
-        print(f"[fitting] Patched mrsi.tree with fit-aligned / fit-U / fit-V")
+        print(f"[fitting] Patched mrsi.tree (+{len(fit_created)} fit, +{len(data_created)} data entries)")
 
     # ── Load & plot concentration maps ────────────────────────────────────────
     try:

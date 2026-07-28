@@ -10,15 +10,15 @@ Reads  : <data_dir>/wref_o.npy
          <out_dir>/coilmap/ecalib_pp.npy
          <out_dir>/b0map/B0_map.npy
          <out_dir>/lipid_removal/mrsi_ksp_scaled.npy
-         <out_dir>/spice/V_subspace.npy
-         [<out_dir>/spice/<csv_name>.csv]  (for subspace if V not saved)
-Writes : <hess_dir>/mHm_{vox}.npy  for each brain voxel
+         <out_dir>/spice_<run_tag>/V_subspace.npy   (tag e.g. w5000_l0.0001)
+         [<out_dir>/spice_<run_tag>/<csv_name>.csv]
+Writes : <out_dir>/hessian_<run_tag>/mHm_{vox}.npy  for each brain voxel
+         (or explicit --hess-dir to override)
 
 Usage:
-    python scripts/08_Laplacian_Covariance.py \
-        --data-dir  ./data/ \
-        --out-dir   ./output \
-        --hess-dir  ./output/hessian \
+    python scripts/uncertainty/analytical/Uncert_01_Laplacian_Covariance.py \
+        --data-dir  data/processed/invivo_250305_01 \
+        --run-tag   w5000_l0.0001 \
         --rank 20 --lambda 1e-4 --max-workers 8 \
         [--vox-start 0 --vox-end 100]    # optional: parallelise over voxel ranges
 """
@@ -30,6 +30,7 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"]  = "1"
 
 import argparse
+import re
 import sys
 import traceback
 from concurrent.futures import ProcessPoolExecutor
@@ -44,7 +45,9 @@ from scipy.ndimage import binary_erosion
 from scipy.sparse.linalg import LinearOperator, cg
 from tqdm import tqdm
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
+from utils.scan_params import load_scan_params
+from utils.pipeline_utils import make_brain_mask
 from utils.utils import (
     NUFFTOp, calc_Bmatrix, read_training_data_from_csv, Calc_B0_matrix_mx,
     build_gram_for_worker,
@@ -133,24 +136,30 @@ def make_fft1d_op(shape, mode="fid2spec", dtype=D_TYPE):
 
 # ── Hessian operator ──────────────────────────────────────────────────────────
 
-def H_action(deltaU, V, B, FHF, WtW, lam):
+def H_action(deltaU, V, B, FHF, WtW, lam, F_loc=None):
     """
     H[deltaU]  where deltaU: (N_vox, rank)
     = B*.conj() * FHF * (B * (deltaU @ V.H)) @ V  +  lam * WtW @ deltaU
+
+    If F_loc is given (finufft backend), FHF is ignored and F_loc.matvec /
+    F_loc.rmatvec are called directly, avoiding the Gram wrapper.
     """
     deltaX = deltaU @ V.conj().T                   # (N_vox, N_seq)
     BX     = (B * deltaX).ravel()
-    z      = (FHF @ BX).reshape(B.shape)
+    if F_loc is not None:
+        z = F_loc.rmatvec(F_loc.matvec(BX.astype(D_TYPE))).reshape(B.shape)
+    else:
+        z = (FHF @ BX).reshape(B.shape)
     term   = (B.conj() * z) @ V                    # (N_vox, rank)
     reg    = lam * (WtW @ deltaU)
     return (term + reg).astype(D_TYPE)
 
 
-def make_H_linop(N_vox, rank, V, B, FHF, WtW, lam) -> LinearOperator:
+def make_H_linop(N_vox, rank, V, B, FHF, WtW, lam, F_loc=None) -> LinearOperator:
     d = N_vox * rank
     def mv(u_flat):
         dU = u_flat.reshape(N_vox, rank).astype(D_TYPE)
-        return H_action(dU, V, B, FHF, WtW, lam).ravel().astype(D_TYPE)
+        return H_action(dU, V, B, FHF, WtW, lam, F_loc=F_loc).ravel().astype(D_TYPE)
     return LinearOperator((d, d), matvec=mv, dtype=D_TYPE)
 
 
@@ -188,14 +197,17 @@ def init_worker(V_, B0_mat_, WW_, backend_,
     MITER          = MITER_
 
     im_size   = tuple(im_size_)
-    Gram_OP, F1D = build_gram_for_worker(
+    Gram_OP, F1D, F_loc = build_gram_for_worker(
         backend_, im_size, D_TYPE,
         ktraj_np=ktraj_np_, grid_size=tuple(grid_size_) if grid_size_ is not None else None,
         kernel_np=kernel_np_, device_str=device_str_,
         trej_np=trej_np_, coil_smap_raw_np=coil_smap_raw_np_, n_coils=n_coils_,
     )
-    fFHFf   = F1D.H @ Gram_OP @ F1D
-    Hess_op = make_H_linop(N_VOXEL, NUM_SPICE_RANK, V, B0_mat, fFHFf, WW, lam)
+    if F_loc is not None:   # finufft: call F.matvec / F.rmatvec directly
+        Hess_op = make_H_linop(N_VOXEL, NUM_SPICE_RANK, V, B0_mat, None, WW, lam, F_loc=F_loc)
+    else:                   # torchnufft: F1D.H @ Toeplitz_Gram @ F1D
+        fFHFf   = F1D.H @ Gram_OP @ F1D
+        Hess_op = make_H_linop(N_VOXEL, NUM_SPICE_RANK, V, B0_mat, fFHFf, WW, lam)
 
 
 def solve_one_voxel(vox_idx):
@@ -227,32 +239,84 @@ def solve_one_voxel(vox_idx):
 
 # ── argparse ──────────────────────────────────────────────────────────────────
 
+def parse_run_tag(run_tag):
+    """Parse a recon_01_run_spice.py run-tag like 'w5000_l0.0001' -> (wmax, lam).
+
+    Returns (None, None) if run_tag is empty or doesn't match the w<..>_l<..> pattern.
+    """
+    if not run_tag:
+        return None, None
+    m = re.match(r"^w([0-9.eE+-]+)_l([0-9.eE+-]+)$", run_tag)
+    if not m:
+        return None, None
+    return float(m.group(1)), float(m.group(2))
+
+
+def resolve_lambda_args(args):
+    """Fill in --lambda/--lambda-we-max from --run-tag when omitted, and warn
+    (without overriding) when an explicitly-passed value disagrees with the tag."""
+    tag_wmax, tag_lam = parse_run_tag(args.run_tag)
+
+    if args.lam is None:
+        args.lam = tag_lam if tag_lam is not None else 1e-4
+    elif tag_lam is not None and not np.isclose(args.lam, tag_lam, rtol=1e-6):
+        print(f"[uncert] WARNING: --lambda {args.lam:g} does not match --run-tag "
+              f"{args.run_tag!r} (which implies lambda={tag_lam:g}). "
+              f"Double-check you're pointing at the right SPICE run — "
+              f"proceeding with the explicitly passed --lambda {args.lam:g}.")
+
+    if args.lambda_we_max is None:
+        args.lambda_we_max = tag_wmax if tag_wmax is not None else 5000.0
+    elif tag_wmax is not None and not np.isclose(args.lambda_we_max, tag_wmax, rtol=1e-6):
+        print(f"[uncert] WARNING: --lambda-we-max {args.lambda_we_max:g} does not match "
+              f"--run-tag {args.run_tag!r} (which implies wmax={tag_wmax:g}). "
+              f"Double-check you're pointing at the right SPICE run — "
+              f"proceeding with the explicitly passed --lambda-we-max {args.lambda_we_max:g}.")
+
+    return args
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="SPICE Hessian uncertainty — step 8")
     p.add_argument("--data-dir",      required=True)
-    p.add_argument("--out-dir",       default="./output")
+    p.add_argument("--out-dir",       default=None,
+                   help="Output directory (default: ./output/<subject_id> derived from --data-dir)")
     p.add_argument("--backend",       default="torchnufft",
                    choices=["torchnufft", "finufft"],
                    help="NUFFT backend: torchnufft (default) or finufft")
     p.add_argument("--hess-dir",      default=None,
                    help="Output directory for mHm_*.npy (default: <out-dir>/hessian)")
-    p.add_argument("--dwelltime",     type=float, default=5e-6)
-    p.add_argument("--k-points",      type=int,   default=39762)
+    p.add_argument("--dwelltime",     type=float, default=None)
+    p.add_argument("--k-points",      type=int, default=None)
     p.add_argument("--n-seq-points",  type=int,   default=300)
-    p.add_argument("--n-coils",       type=int,   default=32)
+    p.add_argument("--n-coils",       type=int, default=None)
     p.add_argument("--dim",           type=int,   nargs=2, default=[64, 64], metavar=("NY", "NX"))
     p.add_argument("--rank",          type=int,   default=20,
                    help="SPICE subspace rank (must match 04_run_spice.py)")
-    p.add_argument("--lambda",        type=float, default=1e-4, dest="lam",
-                   help="Regularisation lambda for Hessian (same as SPICE solve)")
-    p.add_argument("--lambda-we-max", type=float, default=5000.0,
-                   help="Max edge weight W_max for calc_Bmatrix")
+    p.add_argument("--lambda",        type=float, default=None, dest="lam",
+                   help="Regularisation lambda for Hessian (same as SPICE solve). "
+                        "If omitted, parsed from --run-tag (e.g. w5000_l0.0001); "
+                        "if both given and they disagree, a warning is printed and "
+                        "the explicit --lambda wins.")
+    p.add_argument("--lambda-we-max", type=float, default=None,
+                   help="Max edge weight W_max for calc_Bmatrix. "
+                        "If omitted, parsed from --run-tag (e.g. w5000_l0.0001); "
+                        "if both given and they disagree, a warning is printed and "
+                        "the explicit --lambda-we-max wins.")
     p.add_argument("--pool-size",     type=int,   default=1)
+    p.add_argument("--minpool",       action="store_true",
+                   help="Use directional min-pooling for edge weights; match recon_01 --minpool.")
     p.add_argument("--brain-threshold", type=float, default=0.08)
     p.add_argument("--brain-erosion",   type=int,   default=3)
+    p.add_argument("--brain-mask-cleanup", action="store_true",
+                   help="Extra cleanup pass on the thresholded brain mask: keep only the "
+                        "largest connected component and fill enclosed holes. Default: off. "
+                        "Match whatever was passed to recon_01_run_spice.py for this run.")
+    p.add_argument("--basis-dir",     default="./basis",
+                   help="Shared basis directory (contains SS_training CSV)")
     p.add_argument("--csv-name",      default="SS_training",
-                   help="CSV filename in spice/ dir (fallback if V_subspace.npy absent)")
-    p.add_argument("--max-workers",   type=int,   default=8)
+                   help="CSV filename in basis/ dir (fallback if V_subspace.npy absent)")
+    p.add_argument("--max-workers",   type=int,   default=4)
     p.add_argument("--cg-maxiter",    type=int,   default=300)
     p.add_argument("--cg-rtol",       type=float, default=1e-3)
     # voxel range — lets multiple cluster jobs run in parallel on different slices
@@ -260,6 +324,9 @@ def parse_args():
                    help="Start index into the brain voxel list (inclusive, default: 0)")
     p.add_argument("--vox-end",       type=int,   default=None,
                    help="End index into the brain voxel list (exclusive, default: all)")
+    p.add_argument("--run-tag",       default="",
+                   help="Run identifier from recon_01 (e.g. w5000_l0.0001); "
+                        "appended to spice/hessian subdir names")
     return p.parse_args()
 
 
@@ -267,12 +334,17 @@ def parse_args():
 
 def main():
     args       = parse_args()
+    args       = resolve_lambda_args(args)
     data_dir   = args.data_dir.rstrip("/") + "/"
+    if args.out_dir is None:
+        args.out_dir = os.path.join("./output", os.path.basename(args.data_dir.rstrip("/")))
+    load_scan_params(args, data_dir, k_key="k_mrsi")
     coilmap_dir = os.path.join(args.out_dir, "coilmap")
     b0map_dir   = os.path.join(args.out_dir, "b0map")
     lprm_dir    = os.path.join(args.out_dir, "lipid_removal")
-    spice_dir   = os.path.join(args.out_dir, "spice")
-    hess_dir    = args.hess_dir or os.path.join(args.out_dir, "hessian")
+    _tg         = lambda b: f"{b}_{args.run_tag}" if args.run_tag else b
+    spice_dir   = os.path.join(args.out_dir, _tg("spice"))
+    hess_dir    = args.hess_dir or os.path.join(args.out_dir, _tg("hessian"))
     os.makedirs(hess_dir, exist_ok=True)
 
     Ny, Nx   = args.dim
@@ -300,29 +372,29 @@ def main():
         V_full = np.load(v_path)                              # (N_SEQ, rank_saved)
         print(f"[uncert] Loaded V_subspace.npy  shape={V_full.shape}")
     else:
-        print(f"[uncert] V_subspace.npy not found, building from {args.csv_name}.csv …")
-        training = read_training_data_from_csv(spice_dir, args.csv_name).astype(D_TYPE)
+        print(f"[uncert] V_subspace.npy not found, building from {args.basis_dir}/{args.csv_name}.csv …")
+        training = read_training_data_from_csv(args.basis_dir, args.csv_name).astype(D_TYPE)
         _, _, vh = np.linalg.svd(training, full_matrices=False)
         V_full   = vh.conj().T                                # (N_SEQ, rank)
     V = V_full[:, :args.rank].astype(D_TYPE)                  # (N_SEQ, rank)
     print(f"[uncert] V shape={V.shape}")
 
     # ── B0 matrix ─────────────────────────────────────────────────────────────
-    B0_map_clean = np.nan_to_num(-B0_map, nan=0.0)
+    B0_map_clean = np.nan_to_num(B0_map, nan=0.0)
     B0_mat = Calc_B0_matrix_mx(B0_map_clean, TIME_AXIS)       # (N_vox, N_SEQ)
     print(f"[uncert] B0_mat shape={B0_mat.shape}")
 
     # ── Brain mask ─────────────────────────────────────────────────────────────
-    wref_2d   = np.abs(wref_img.squeeze(-1))
-    wref_norm = (wref_2d - wref_2d.min()) / (wref_2d.max() - wref_2d.min() + 1e-12)
-    brain_mask = wref_norm > args.brain_threshold
+    wref_norm, brain_mask, _ = make_brain_mask(
+        wref_img, args.brain_threshold, args.brain_erosion,
+        cleanup=args.brain_mask_cleanup)
     print(f"[uncert] Brain voxels: {brain_mask.sum()}")
 
     # ── Edge-preserving W ─────────────────────────────────────────────────────
     print("[uncert] Building edge-preserving W …")
     W_edge, _, _W, Nb = calc_Bmatrix(
         wref_norm, wmax=args.lambda_we_max, adj=8,
-        pool_size=args.pool_size, minpooling_Handler=True,
+        pool_size=args.pool_size, minpooling_Handler=args.minpool,
         brain_mask=brain_mask, mask_dilate_layers=3,
     )
     WW = (W_edge.conj().T @ W_edge).astype(D_TYPE)
@@ -353,20 +425,26 @@ def main():
         print("[uncert] Using finufft backend (no Toeplitz kernel needed).")
 
     # ── Quick in-process check: build once to verify shapes ───────────────────
-    _Gram, _F1D = build_gram_for_worker(
+    _Gram, _F1D, _F_loc = build_gram_for_worker(
         args.backend, im_size, D_TYPE,
         ktraj_np=ktraj_np, grid_size=grid_size, kernel_np=kernel_np, device_str=device_str,
         trej_np=trej_np, coil_smap_raw_np=coil_smap_np, n_coils=N_COILS,
     )
-    _fFHFf  = _F1D.H @ _Gram @ _F1D
-    _Hess   = make_H_linop(N_VOXEL, args.rank, V, B0_mat, _fFHFf, WW, args.lam)
+    if _F_loc is not None:
+        _Hess = make_H_linop(N_VOXEL, args.rank, V, B0_mat, None, WW, args.lam, F_loc=_F_loc)
+    else:
+        _fFHFf = _F1D.H @ _Gram @ _F1D
+        _Hess  = make_H_linop(N_VOXEL, args.rank, V, B0_mat, _fFHFf, WW, args.lam)
     print(f"[uncert] Hessian shape={_Hess.shape}  (N_vox*rank={N_VOXEL*args.rank})")
-    del _Gram, _F1D, _fFHFf, _Hess
+    del _Gram, _F1D, _F_loc, _Hess
 
     # ── Parallel voxel CG ─────────────────────────────────────────────────────
     vox_list = np.flatnonzero(brain_mask.ravel())[args.vox_start:args.vox_end]
     print(f"[uncert] Voxel slice [{args.vox_start}:{args.vox_end}]  "
           f"count={len(vox_list)}  max_workers={args.max_workers} …")
+    if len(vox_list) == 0:
+        print("[uncert] No voxels in this slice — exiting.")
+        return
 
     with ProcessPoolExecutor(
         max_workers=args.max_workers,
