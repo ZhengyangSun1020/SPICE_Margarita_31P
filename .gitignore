@@ -44,6 +44,9 @@ viz/
 tmp/
 
 # Experimental / work-in-progress scripts (kept local only)
+scripts/04b_SPICE_refit.py
+scripts/04c_SPICE_uoss_refit.py
+scripts/04d_SPICE_lam20_refit.py
 scripts/recon_method/04b_SPICE_refit.py
 scripts/recon_method/04c_SPICE_uoss_refit.py
 scripts/recon_method/04d_SPICE_lam20_refit.py
