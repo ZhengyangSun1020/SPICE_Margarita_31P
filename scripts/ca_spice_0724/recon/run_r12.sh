@@ -1,7 +1,7 @@
 #!/bin/bash
 # CC-SPICE rank 12 (first 12 columns of VD), mu 30, drawn masks, all four 24-07 bouts; FIDs + spectra saved
 cd /home/zsun/SPICE_Margarita/scripts; PY=/home/zsun/miniconda3/envs/zs_SPICE_MARGARITA/bin/python
-S="$(cd "$(dirname "$0")" && pwd)"   # this folder (hybrid_slam_spice.py)
+S=/home/zsun/SPICE_Margarita/scripts/ca_spice_0724/recon   # hybrid_slam_spice.py
 for d in 283 279 281 277; do
   O=/home/zsun/SPICE_Margarita/output_study_mid$d
   $PY -c "import numpy as np; np.save('$O/VD12.npy', np.load('$O/VD.npy')[:, :12])"
