@@ -173,6 +173,16 @@ def parse_args():
     p.add_argument("--roi-mask",     default=None,
                    help=".npy boolean mask from roi_selector_31p.py")
     p.add_argument("--wmax",         type=float, default=5e3)
+    p.add_argument("--prior-gamma",  type=float, default=1.0,
+                   help="Optional gamma on normalized spatial prior before graph build")
+    p.add_argument("--prior-scale",  type=float, default=1.0,
+                   help="Scale for displayed prior map only")
+    p.add_argument("--prior-scale-graph", type=float, default=1.0,
+                   help="Scale for graph-construction prior only")
+    p.add_argument("--prior-flip-native-y", action="store_true",
+                   help="Flip registered localizer prior in native y before graph build")
+    p.add_argument("--prior-only", action="store_true",
+                   help="Build and save prior/graph diagnostics only; skip SPICE solve")
     p.add_argument("--lambda-out",   type=float, default=0.0,
                    help="Tikhonov penalty on out-of-ROI voxels (e.g. 1.0). Requires --roi-mask.")
     p.add_argument("--no-phase-corr", action="store_true")
@@ -208,7 +218,15 @@ def main():
 
     # ── 2. Trajectory + DCF (shared) ────────────────────────────────────
     traj = build_trajectory_2d(info["first_circle"], n_rings, traj_pts)
-    dcf  = compute_crt_dcf_hamming(traj)
+    dcf  = compute_crt_dcf_hamming(traj)   # DCF from max-norm radius (unchanged)
+    # Reconstruct on a FIXED PHYSICAL FOV (matching MATLAB CONCEPTPerform2DDirectFT):
+    # rescale the max-normalized trajectory (outer ring -> ±0.5) back to physical
+    # cycles/pixel (outer -> k_norm_max_phys < 0.5) AFTER computing the DCF, so the
+    # recon FOV / voxel registration is identical for any ring count (max-norm ties
+    # the FOV to the outermost ring -> ~1-voxel offset between 5-ring and 80-ring).
+    traj = traj.copy()
+    traj[:, 0] *= float(info["k_norm_max_phys"]) / 0.5
+    traj[:, 1] *= float(info["k_norm_max_phys"]) / 0.5
     nufft_op = mrinufft.get_operator(
         "finufft", samples=traj, shape=(N, N), n_coils=1, density=dcf)
     n_kpts = traj.shape[0]
@@ -228,17 +246,19 @@ def main():
         apo = None
 
     # ── 5. Spatial prior + Laplacian ────────────────────────────────────
-    # Use first-rep adjoint magnitude as fallback spatial prior
-    kdata_r0 = all_kdata[0]
-    if not args.no_phase_corr:
-        kdata_r0 = concept_phase_correction(kdata_r0, info["_ti_per_ring"])
-    kflat_r0 = kdata_r0[:, :, 0, :].transpose(2, 0, 1).reshape(-1, n_spec)
-    if shift_phase is not None:
-        kflat_r0 = kflat_r0 * shift_phase[:, np.newaxis]
-    adj_r0 = np.stack([nufft_op.adj_op(kflat_r0[:, t]).reshape(N, N)
-                        for t in range(n_spec)], axis=-1)
-    mag_map  = np.abs(adj_r0).mean(axis=-1)          # keep unnormalized for PNG
-    mag_norm = mag_map / (mag_map.max() + 1e-30)
+    mag_norm = None
+    if args.localizer is None:
+        # Use first-rep adjoint magnitude as fallback spatial prior.
+        kdata_r0 = all_kdata[0]
+        if not args.no_phase_corr:
+            kdata_r0 = concept_phase_correction(kdata_r0, info["_ti_per_ring"])
+        kflat_r0 = kdata_r0[:, :, 0, :].transpose(2, 0, 1).reshape(-1, n_spec)
+        if shift_phase is not None:
+            kflat_r0 = kflat_r0 * shift_phase[:, np.newaxis]
+        adj_r0 = np.stack([nufft_op.adj_op(kflat_r0[:, t]).reshape(N, N)
+                           for t in range(n_spec)], axis=-1)
+        mag_map = np.abs(adj_r0).mean(axis=-1)
+        mag_norm = mag_map / (mag_map.max() + 1e-30)
 
     # Spatial prior for Laplacian: use registered localizer when provided,
     # otherwise fall back to adjoint magnitude.
@@ -249,6 +269,9 @@ def main():
             pos_sag = info["pos_sag"],
             pos_cor = info["pos_cor"],
             pos_tra = info["pos_tra"])
+        if args.prior_flip_native_y:
+            anatomy_bg = np.flipud(anatomy_bg)
+            print("[dyn-spice] prior native-y flip: enabled")
         spatial_prior = anatomy_bg
         _prior_label  = "registered localizer (1H)"
     else:
@@ -263,9 +286,25 @@ def main():
             sys.exit(f"ROI mask shape {roi.shape} != ({N},{N})")
         print(f"[dyn-spice] ROI: {int(roi.sum())}/{N*N} voxels — decoupling edges at boundary")
 
+    if args.prior_gamma != 1.0:
+        spatial_prior = np.power(np.clip(spatial_prior, 0.0, 1.0), args.prior_gamma).astype(np.float32)
+        _prior_label = f"{_prior_label}, gamma={args.prior_gamma:g}"
+
+    if roi is not None:
+        spatial_prior = spatial_prior * roi.T.astype(np.float32)
+        _prior_label = f"{_prior_label} + ROI masked"
+
+    spatial_prior_graph = spatial_prior.astype(np.float32)
+    spatial_prior_plot = spatial_prior.astype(np.float32)
+    if args.prior_scale != 1.0:
+        spatial_prior_plot = (spatial_prior_plot * float(args.prior_scale)).astype(np.float32)
+        _prior_label = f"{_prior_label}, plot_scale={args.prior_scale:g}"
+    if args.prior_scale_graph != 1.0:
+        spatial_prior_graph = (spatial_prior_graph * float(args.prior_scale_graph)).astype(np.float32)
+
     # ── Save spatial prior map ──────────────────────────────────────────────
     _fig_sp, _ax_sp = plt.subplots(figsize=(6, 5))
-    _im_sp = _ax_sp.imshow(spatial_prior, origin='lower', cmap='Greens', aspect='equal')
+    _im_sp = _ax_sp.imshow(spatial_prior_plot, origin='lower', cmap='Greens', aspect='equal')
     plt.colorbar(_im_sp, ax=_ax_sp)
     _ax_sp.set_title(f"Voxel-level sum prior map ({_prior_label})", fontsize=11)
     _ax_sp.set_xlabel("x (voxel)"); _ax_sp.set_ylabel("y (voxel)")
@@ -274,7 +313,66 @@ def main():
     plt.close(_fig_sp)
     print(f"[dyn-spice] Saved spatial prior map -> {fig_dir}/spatial_prior_map.png")
 
-    WW, _ = calc_Bmatrix_simple(spatial_prior, wmax=args.wmax, adj=8, mask=roi)
+    if args.localizer:
+        _fig_or, (_ax_or0, _ax_or1) = plt.subplots(1, 2, figsize=(10, 4.5))
+        _ax_or0.imshow(anatomy_bg, origin='lower', cmap='gray', aspect='equal')
+        _ax_or0.set_title("Registered localizer")
+        _ax_or0.set_xlabel("x (voxel)")
+        _ax_or0.set_ylabel("y (voxel)")
+        _im_or = _ax_or1.imshow(spatial_prior_plot, origin='lower', cmap='Greens', aspect='equal')
+        plt.colorbar(_im_or, ax=_ax_or1)
+        _ax_or1.set_title("Spatial prior (same orientation)")
+        _ax_or1.set_xlabel("x (voxel)")
+        _ax_or1.set_ylabel("y (voxel)")
+        _fig_or.tight_layout()
+        _fig_or.savefig(os.path.join(fig_dir, "localizer_vs_prior_orientation_check.png"), dpi=150, bbox_inches='tight')
+        plt.close(_fig_or)
+        print(f"[dyn-spice] Saved orientation check -> {fig_dir}/localizer_vs_prior_orientation_check.png")
+    WW, _, A_graph = calc_Bmatrix_simple(spatial_prior_graph, wmax=args.wmax, adj=8, mask=roi, return_graph=True)
+
+    voxel_sum_map = np.sum(A_graph, axis=0).reshape(N, N)
+    n_neighbors_max = 8.0
+    expected_max = float(args.wmax) * n_neighbors_max
+    vmax_actual = float(voxel_sum_map.max())
+    print(f"[dyn-spice] Graph weight-sum max={vmax_actual:.3g} (expected scale <= {expected_max:.3g} for adj=8)")
+
+    _fig_vs, _ax_vs = plt.subplots(figsize=(6, 5))
+    _im_vs = _ax_vs.imshow(voxel_sum_map, origin='lower', cmap='Greens', aspect='equal')
+    plt.colorbar(_im_vs, ax=_ax_vs)
+    _ax_vs.set_title("Voxel-level sum prior map (graph weights)", fontsize=11)
+    _ax_vs.set_xlabel("x (voxel)")
+    _ax_vs.set_ylabel("y (voxel)")
+    _fig_vs.tight_layout()
+    _fig_vs.savefig(os.path.join(fig_dir, "spatial_prior_voxel_sum_map.png"), dpi=150, bbox_inches='tight')
+    plt.close(_fig_vs)
+    print(f"[dyn-spice] Saved graph weight-sum prior map -> {fig_dir}/spatial_prior_voxel_sum_map.png")
+
+    voxel_sum_norm = np.clip(voxel_sum_map / (expected_max + 1e-12), 0.0, 1.0)
+    _fig_vsn, _ax_vsn = plt.subplots(figsize=(6, 5))
+    _im_vsn = _ax_vsn.imshow(voxel_sum_norm, origin='lower', cmap='Greens', aspect='equal', vmin=0.0, vmax=1.0)
+    plt.colorbar(_im_vsn, ax=_ax_vsn, label="normalized weight sum")
+    _ax_vsn.set_title("Voxel-level sum prior map (graph weights, normalized)", fontsize=11)
+    _ax_vsn.set_xlabel("x (voxel)")
+    _ax_vsn.set_ylabel("y (voxel)")
+    _fig_vsn.tight_layout()
+    _fig_vsn.savefig(os.path.join(fig_dir, "spatial_prior_voxel_sum_map_normalized.png"), dpi=150, bbox_inches='tight')
+    plt.close(_fig_vsn)
+    print(f"[dyn-spice] Saved normalized graph weight-sum map -> {fig_dir}/spatial_prior_voxel_sum_map_normalized.png")
+
+    _fig_ov, _ax_ov = plt.subplots(figsize=(6, 5))
+    _ax_ov.imshow(spatial_prior_plot, origin='lower', cmap='gray', aspect='equal')
+    _ax_ov.contour(voxel_sum_norm, levels=[0.2, 0.4, 0.6, 0.8], colors='lime', linewidths=1.0, origin='lower')
+    _ax_ov.set_title("Prior + graph-weight contours (orientation check)", fontsize=11)
+    _ax_ov.set_xlabel("x (voxel)")
+    _ax_ov.set_ylabel("y (voxel)")
+    _fig_ov.tight_layout()
+    _fig_ov.savefig(os.path.join(fig_dir, "spatial_prior_graph_overlay.png"), dpi=150, bbox_inches='tight')
+    plt.close(_fig_ov)
+    print(f"[dyn-spice] Saved prior/graph overlay -> {fig_dir}/spatial_prior_graph_overlay.png")
+
+    if args.prior_only:
+        print("[dyn-spice] Prior-only mode done.")
+        return
 
     # Out-of-ROI mask for Tikhonov suppression (row-major flat)
     out_roi_flat = None

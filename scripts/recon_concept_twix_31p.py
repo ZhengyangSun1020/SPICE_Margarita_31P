@@ -75,7 +75,7 @@ def concept_phase_correction(kdata, temporal_interleaves):
     -------
     corrected : same shape as input, phase-corrected.
     """
-    ns, pointsInFID, _, n_rings = kdata.shape
+    ns, pointsInFID, n_coils, n_rings = kdata.shape
     vs = pointsInFID * 2
 
     if np.isscalar(temporal_interleaves):
@@ -83,40 +83,39 @@ def concept_phase_correction(kdata, temporal_interleaves):
     else:
         ti_arr = np.asarray(temporal_interleaves)
 
-    # Build per-ring phase correction: (ns, vs, n_rings)
     # MATLAB:  timeoffset = ti * ((1:ns)-1) / ns          → (ns,)
     #          phasecorr  = exp(-2πi * timeoffset' * ((0:vs-1)/vs - 0.5))
-    sample_idx = np.arange(ns, dtype=np.float64)       # 0 … ns-1
+    sample_idx = np.arange(ns, dtype=np.float64)            # 0 … ns-1
     freq_axis  = np.arange(vs, dtype=np.float64) / vs - 0.5  # (vs,)
 
-    phasecorr = np.zeros((ns, vs, n_rings), dtype=np.complex128)
+    # Process ONE ring at a time. Running the whole (ns, vs, C, R) array through
+    # the 2x zero-padded FFT chain at once needs ~8-10 simultaneous full-size
+    # copies (and upcasts the entire array to complex128 at the phasecorr
+    # multiply), which OOMs on large multi-coil data. Per ring the working set
+    # is a single (ns, vs, C) slice (tens of MB). The per-ring math (spectral
+    # FFT + per-ring phasecorr broadcast over coils) is independent, so the
+    # result is numerically identical to the vectorized form.
+    out = np.empty_like(kdata)                              # (ns, pointsInFID, C, R), complex64
+    padded = np.zeros((ns, vs, n_coils), dtype=np.complex128)   # reused buffer; first half stays 0
     for r in range(n_rings):
-        timeoffset = ti_arr[r] * sample_idx / ns        # (ns,)
-        phasecorr[:, :, r] = np.exp(-2j * np.pi * np.outer(timeoffset, freq_axis))
+        timeoffset = ti_arr[r] * sample_idx / ns           # (ns,)
+        phasecorr = np.exp(-2j * np.pi * np.outer(timeoffset, freq_axis))  # (ns, vs), complex128
 
-    # Zero-pad: prepend pointsInFID zeros along spectral axis
-    pad = np.zeros_like(kdata)
-    kdata_padded = np.concatenate([pad, kdata], axis=1)  # (ns, vs, C, R)
+        # Zero-pad: prepend pointsInFID zeros along the spectral axis. The first
+        # half of `padded` is never written, so it remains zero across rings.
+        padded[:, pointsInFID:, :] = kdata[:, :, :, r]
 
-    # iFFT along spectral dim (axis 1)
-    out = np.fft.fftshift(
-        np.fft.ifft(np.fft.fftshift(kdata_padded, axes=1), axis=1),
-        axes=1,
-    )
+        # iFFT → conj(phasecorr) (broadcast over coils) → FFT, along spectral axis
+        tmp = np.fft.fftshift(
+            np.fft.ifft(np.fft.fftshift(padded, axes=1), axis=1), axes=1)
+        tmp *= np.conj(phasecorr[:, :, np.newaxis])
+        tmp = np.fft.fftshift(
+            np.fft.fft(np.fft.fftshift(tmp, axes=1), axis=1), axes=1)
 
-    # Apply conj(phasecorr)  — broadcast over coils
-    out = out * np.conj(phasecorr[:, :, np.newaxis, :])
+        # Keep second half (discard the zero-padded region); store as complex64
+        out[:, :, :, r] = tmp[:, vs // 2:, :]
 
-    # FFT back
-    out = np.fft.fftshift(
-        np.fft.fft(np.fft.fftshift(out, axes=1), axis=1),
-        axes=1,
-    )
-
-    # Keep second half: MATLAB  in(:, vs/2+1 : end, …)  →  0-indexed [vs//2 :]
-    out = out[:, vs // 2:, :, :]
-
-    return out.astype(np.complex64)
+    return out
 
 
 def parse_args():

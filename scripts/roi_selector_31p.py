@@ -113,10 +113,10 @@ def voxel_to_lps(xi, yi, N, pos_sag, pos_cor, vox_size):
       xi = column index (0 = left = patient's right = −L)
       yi = row    index (0 = bottom = posterior = +P)
 
-      L(xi) = pos_sag + (xi - N//2) * vox_size
-      P(yi) = pos_cor − (yi − N//2) * vox_size
+      L(xi) = pos_sag + (xi - (N-1)/2) * vox_size
+      P(yi) = pos_cor − (yi − (N-1)/2) * vox_size
     """
-    ctr = N // 2
+    ctr = (N - 1) / 2.0   # voxel-center convention (correct for even N; matches MATLAB gold-standard grid)
     L = pos_sag + (xi - ctr) * vox_size
     P = pos_cor - (yi - ctr) * vox_size
     return L, P

@@ -17,7 +17,7 @@ Key differences from 2D:
 Usage:
     python scripts/06c_iterative_recon_31p_3d.py \
         --dat "/mnt/f/AliceConceptB1/in_vivo_3T/phantom/For_Susan/meas_MID02472_FID207000_2D_CRT_12X12_NA1_6rings.dat" \
-        --out-dir output_phantom_2D_12x12_6rings --lam 0.001 --maxiter 100
+        --out-dir output_phantom_2D_12x12_6rings --lam 1 --maxiter 100
 """
 
 import argparse
@@ -664,10 +664,28 @@ def wsvd_combine(fid_mc, noise_cov=None):
 
 # ── Iterative reconstruction ─────────────────────────────────────────────────
 
+def build_dft_matrix(traj, Nx, Ny, Nz):
+    """Exact (non-gridded) DFT operator matching the finufft convention here.
+
+    E[j, v] = exp(-2i*pi * <traj[j], r_v - N//2>), with r_v the (ix,iy,iz)
+    voxel index in C-order over (Nx,Ny,Nz) — identical to ndarray.flat / delta.flat[v].
+    So forward: kdata = E @ image_flat ; adjoint: image_flat = E.conj().T @ kdata.
+    traj columns are (kx,ky,kz) in cycles/voxel ([-0.5,0.5]). This is the slow but
+    exact slow-FT (sft2) analogue of the MATLAB CONCEPTPerform2DDirectFT path.
+    """
+    ix, iy, iz = np.unravel_index(np.arange(Nx * Ny * Nz), (Nx, Ny, Nz))
+    rx = ix - Nx // 2
+    ry = iy - Ny // 2
+    rz = iz - Nz // 2
+    phase = (np.outer(traj[:, 0], rx) + np.outer(traj[:, 1], ry)
+             + np.outer(traj[:, 2], rz))                 # (n_kpts, N_vox)
+    return np.exp(-2j * np.pi * phase).astype(np.complex128)
+
+
 def iterative_recon_3d(kdata_mc, traj, Nx, Ny, Nz, n_spec, n_ch=1,
                         noise_cov=None, nufft_op_batch=None,
                         dcf_hamming_radius=None,
-                        maxiter=100, lam=0.0, rtol=1e-3):
+                        maxiter=100, lam=0.0, rtol=1e-3, use_dft=False):
     """3D iterative CG reconstruction.
 
     E^H E is computed exactly via column-by-column NUFFT (same operator as the RHS),
@@ -694,7 +712,7 @@ def iterative_recon_3d(kdata_mc, traj, Nx, Ny, Nz, n_spec, n_ch=1,
     # adj_raw_fid = unweighted adjoint (simple gridding)
     # adj_dcf_fid = DCF-weighted adjoint (analytical annular weights)
 
-    # NUFFT on original grid (batched over spectral for adjoint)
+    # Recon operator: NUFFT (gridding) OR exact direct DFT (no gridding)
     nufft_op_1 = mrinufft.get_operator(
         "finufft", samples=traj, shape=(Nx, Ny, Nz),
         n_coils=n_spec, density=False)
@@ -703,18 +721,33 @@ def iterative_recon_3d(kdata_mc, traj, Nx, Ny, Nz, n_spec, n_ch=1,
     dcf_weights = compute_crt_dcf_hamming(traj, hamming_radius=dcf_hamming_radius)   # (n_kpts,)
     print(f"[iter3d] DCF weights: min={dcf_weights.min():.4f}  max={dcf_weights.max():.4f}")
 
-    if not adjoint_only:
-        # Single-coil NUFFT for exact Gram computation (same traj/shape as nufft_op_1)
-        nufft_single = mrinufft.get_operator(
-            "finufft", samples=traj, shape=(Nx, Ny, Nz), n_coils=1, density=False)
+    E_dft = None
+    if use_dft:
+        print("[iter3d] Recon engine: EXACT direct DFT (no gridding) — sft2 analogue")
+        E_dft = build_dft_matrix(traj, Nx, Ny, Nz)          # (n_kpts, N_vox)
+    else:
+        print("[iter3d] Recon engine: NUFFT (finufft gridding)")
 
-        # Exact Gram G = E^H E (column-by-column).  Consistent with b_flat from nufft_op_1.
+    def _adj(kd):                                           # kd:(n_kpts,n_spec) -> (n_spec,Nx,Ny,Nz)
+        if use_dft:
+            img = E_dft.conj().T @ kd                       # (N_vox, n_spec)
+            return img.T.reshape(n_spec, Nx, Ny, Nz).astype(G_TYPE)
+        return nufft_op_1.adj_op(kd.T).astype(G_TYPE)
+
+    if not adjoint_only:
         print("[iter3d] Precomputing exact Gram matrix (E^H E) ...")
-        Gram = np.zeros((N_vox, N_vox), dtype=G_TYPE)
-        for v in tqdm(range(N_vox), desc="Gram cols"):
-            delta = np.zeros((Nx, Ny, Nz), dtype=D_TYPE)
-            delta.flat[v] = 1.0
-            Gram[:, v] = nufft_single.adj_op(nufft_single.op(delta)).reshape(N_vox)
+        if use_dft:
+            Gram = (E_dft.conj().T @ E_dft).astype(G_TYPE)  # exact, N_vox x N_vox
+        else:
+            # Single-coil NUFFT for exact Gram computation (same traj/shape as nufft_op_1)
+            nufft_single = mrinufft.get_operator(
+                "finufft", samples=traj, shape=(Nx, Ny, Nz), n_coils=1, density=False)
+            # Exact Gram G = E^H E (column-by-column). Consistent with b_flat from nufft_op_1.
+            Gram = np.zeros((N_vox, N_vox), dtype=G_TYPE)
+            for v in tqdm(range(N_vox), desc="Gram cols"):
+                delta = np.zeros((Nx, Ny, Nz), dtype=D_TYPE)
+                delta.flat[v] = 1.0
+                Gram[:, v] = nufft_single.adj_op(nufft_single.op(delta)).reshape(N_vox)
 
         if lam > 0:
             lam_max = float(np.real(np.linalg.eigvalsh(Gram)).max())
@@ -742,13 +775,13 @@ def iterative_recon_3d(kdata_mc, traj, Nx, Ny, Nz, n_spec, n_ch=1,
         print(f"[iter3d] {label} — adjoint ...")
         kdata_ch = kdata_mc[:, :, ch].astype(D_TYPE)     # (n_kpts, n_spec)
 
-        # Batched adjoint: adj_op expects (n_coils, n_kpts) → transpose
-        b_ch = nufft_op_1.adj_op(kdata_ch.T).astype(G_TYPE)  # (n_spec, Nx, Ny, Nz)
+        # Unweighted adjoint (NUFFT gridding or exact DFT depending on use_dft)
+        b_ch = _adj(kdata_ch)                                  # (n_spec, Nx, Ny, Nz)
         adj_raw_mc[:, ch] = b_ch                               # unweighted adjoint
 
-        # DCF-weighted adjoint (apply analytical weights in k-space before adj_op)
+        # DCF-weighted adjoint (apply analytical weights in k-space before adj)
         kdata_dcf = kdata_ch * dcf_weights[:, np.newaxis]      # (n_kpts, n_spec)
-        adj_dcf_mc[:, ch] = nufft_op_1.adj_op(kdata_dcf.T).astype(G_TYPE)
+        adj_dcf_mc[:, ch] = _adj(kdata_dcf)
 
         if adjoint_only:
             X_mc[:, ch] = adj_dcf_mc[:, ch]   # DCF adjoint as primary output
@@ -803,8 +836,68 @@ def find_best_snr_3d(image_spec):
     return idx[0], idx[1], idx[2], snr_map
 
 
+def _plot_single_slice_spectra_grid(spec_arr, PPM, z, fig_dir, fname_prefix,
+                                    method_name, tag="", ppmlim=None,
+                                    norm_mode="noise", lb_hz=None,
+                                    best_voxel=None):
+    """Plot one spaced voxel-spectra grid for a single reconstruction method."""
+    Nx, Ny, Nz, n_spec = spec_arr.shape
+    if z < 0 or z >= Nz:
+        return
+
+    fig, axes = plt.subplots(Nx, Ny, figsize=(Ny * 1.6, Nx * 1.25), squeeze=False)
+    axes = np.array(axes).reshape(Nx, Ny)
+
+    if ppmlim is None:
+        ppm_min, ppm_max = float(np.min(PPM)), float(np.max(PPM))
+    else:
+        ppm_min, ppm_max = float(min(ppmlim)), float(max(ppmlim))
+    xlim = (ppm_max, ppm_min)
+
+    tail = slice(int(0.8 * n_spec), n_spec)
+    y_top = 0.0
+
+    for yi in range(Ny):
+        for xi in range(Nx):
+            ax = axes[Nx - 1 - xi, yi]  # keep existing display orientation
+            s = np.nan_to_num(np.abs(spec_arr[xi, yi, z, :]))
+
+            if norm_mode == "peak":
+                s_norm = s / (np.max(s) + 1e-20)
+            else:
+                s_norm = s / (np.std(s[tail]) + 1e-20)
+
+            y_top = max(y_top, float(np.percentile(s_norm, 99.5)))
+            ax.plot(PPM, s_norm, color='black', lw=0.5)
+            ax.set_xlim(xlim)
+            ax.axis("off")
+
+            if best_voxel is not None and best_voxel == (xi, yi, z):
+                for spine in ax.spines.values():
+                    spine.set_visible(True)
+                    spine.set_edgecolor("red")
+                    spine.set_linewidth(1.2)
+
+    if y_top <= 0:
+        y_top = 1.0
+
+    for yi in range(Ny):
+        for xi in range(Nx):
+            axes[Nx - 1 - xi, yi].set_ylim(0.0, y_top * 1.05)
+
+    lb_txt = f" | LB={float(lb_hz):.0f} Hz" if lb_hz is not None else ""
+    fig.suptitle(
+        f"{method_name} | slice {z + 1}/{Nz} | grid {Nx}x{Ny} | norm={norm_mode}{lb_txt} | ppm [{ppm_min:.1f}, {ppm_max:.1f}]",
+        fontsize=9,
+    )
+    fig.subplots_adjust(left=0.03, right=0.995, bottom=0.05, top=0.92,
+                        wspace=0.22, hspace=0.22)
+    fig.savefig(os.path.join(fig_dir, f"{fname_prefix}_z{z:02d}{tag}.png"), dpi=170)
+    plt.close(fig)
+
+
 def plot_results_3d(adj_dcf_spec, iter_spec, PPM, ppmlim, fig_dir, tag="",
-                    adj_raw_spec=None):
+                    adj_raw_spec=None, apodization_hz=None):
     """Plot spatial maps and spectra for up to 3 reconstructions.
 
     adj_dcf_spec : DCF-weighted adjoint  (Nx, Ny, Nz, n_spec)
@@ -863,7 +956,7 @@ def plot_results_3d(adj_dcf_spec, iter_spec, PPM, ppmlim, fig_dir, tag="",
                            vmin=vmin, vmax=vmax)
             if row_images[row] is None:
                 row_images[row] = im
-            ax.set_title(f"{rlabel} z={z} [{vmin:.2e},{vmax:.2e}]", fontsize=7)
+            ax.set_title(f"{rlabel} | slice {z + 1}/{Nz} | [{vmin:.2e},{vmax:.2e}]", fontsize=7)
             ax.axis("off")
             if ri == n_recon - 1 and vz == z:   # mark best voxel on bottom row
                 ax.plot(vy, Nx - 1 - vx, "r+", ms=8, mew=1.5)
@@ -880,7 +973,10 @@ def plot_results_3d(adj_dcf_spec, iter_spec, PPM, ppmlim, fig_dir, tag="",
             cbar.set_label("mean |spectrum|", fontsize=7)
 
     title_parts = " | ".join(rl for _, rl in rows_spec)
-    fig.suptitle(f"{title_parts} — mean |spectrum| in [{ppm_min:.2f}, {ppm_max:.2f}] ppm", fontsize=9)
+    fig.suptitle(
+        f"Spatial maps: mean |spectrum| | methods: {title_parts} | ppm [{ppm_min:.2f}, {ppm_max:.2f}]",
+        fontsize=9,
+    )
     fig.tight_layout()
     fig.savefig(os.path.join(fig_dir, f"iter3d_spatial_maps{tag}.png"), dpi=150)
     plt.close(fig)
@@ -898,7 +994,9 @@ def plot_results_3d(adj_dcf_spec, iter_spec, PPM, ppmlim, fig_dir, tag="",
     ax.set_xlabel("ppm")
     ax.set_ylabel("|spectrum|")
     ax.legend(fontsize=8, loc="upper right")
-    ax.set_title(f"Best SNR voxel [{vx},{vy},{vz}]  (SNR={snr_map[vx,vy,vz]:.1f}){tag}")
+    ax.set_title(
+        f"Best-SNR voxel spectrum | voxel [{vx},{vy},{vz}] | slice {vz + 1}/{Nz} | SNR={snr_map[vx,vy,vz]:.1f}{tag}"
+    )
     for pos, name in peaks:
         ax.axvline(pos, color='red', ls='--', lw=0.5, alpha=0.5)
         ax.text(pos, ax.get_ylim()[1] * 0.92, name, fontsize=8, ha='center', color='red')
@@ -916,35 +1014,16 @@ def plot_results_3d(adj_dcf_spec, iter_spec, PPM, ppmlim, fig_dir, tag="",
         if spec_arr is None:
             continue
         for z in range(Nz):
-            fig_z, axes_z = plt.subplots(Nx, Ny, figsize=(Ny * 1.35, Nx * 1.15))
-            axes_z = np.array(axes_z).reshape(Nx, Ny)
-            for yi in range(Ny):
-                for xi in range(Nx):
-                    ax = axes_z[Nx - 1 - xi, yi]  # 90° CCW
-                    sp_v = np.nan_to_num(np.abs(spec_arr[xi, yi, z, :]))
-                    sp_v = sp_v / (sp_v.max() + 1e-20)
-                    ax.plot(sp_v, 'k', lw=0.6)
-                    ax.set_xlim(0, len(sp_v) - 1)
-                    ymax = float(np.max(sp_v)) + 1e-12
-                    ymin = float(np.min(sp_v))
-                    if ymax - ymin < 1e-6:
-                        ymin, ymax = 0.0, 1.0
-                    ax.set_ylim(ymin, ymax)
-                    ax.axis("off")
-                    if z == vz and xi == vx and yi == vy:
-                        for spine in ax.spines.values():
-                            spine.set_visible(True)
-                            spine.set_edgecolor("red")
-                            spine.set_linewidth(1.5)
-                        ax.axis("on")
-                        ax.tick_params(left=False, bottom=False,
-                                       labelleft=False, labelbottom=False)
-            slice_label = " [best SNR slice]" if z == vz else ""
-            fig_z.suptitle(f"{label_prefix} — z={z}{slice_label}{tag}", fontsize=10)
-            fig_z.subplots_adjust(left=0.01, right=0.99, bottom=0.02, top=0.92,
-                                  wspace=0.02, hspace=0.02)
-            fig_z.savefig(os.path.join(fig_dir, f"{fname_prefix}_z{z:02d}{tag}.png"), dpi=150)
-            plt.close(fig_z)
+            _plot_single_slice_spectra_grid(
+                spec_arr, PPM, z, fig_dir,
+                fname_prefix=fname_prefix,
+                method_name=label_prefix,
+                tag=tag,
+                ppmlim=ppmlim,
+                norm_mode="noise",
+                lb_hz=apodization_hz,
+                best_voxel=(vx, vy, vz),
+            )
 
     print(f"[iter3d] Figures saved to {fig_dir}")
 
@@ -1051,6 +1130,9 @@ def parse_args():
                    help="Print header/MDH info and exit (no reconstruction)")
     p.add_argument("--no-phase-corr", action="store_true")
     p.add_argument("--no-fov-shift", action="store_true")
+    p.add_argument("--recon-method", choices=["nufft", "dft"], default="nufft",
+                   help="Recon engine: nufft (finufft gridding, default) or dft "
+                        "(exact direct slow-FT, no gridding — MATLAB sft2 analogue)")
     p.add_argument("--maxiter", type=int, default=0,
                    help="CG iterations (0 = DCF adjoint only [default], >0 = iterative CG)")
     p.add_argument("--lam", type=float, default=1.0,
@@ -1101,6 +1183,8 @@ def main():
         return
 
     kdata   = info["kdata"]
+    info["kdata"] = None   # drop the dict's reference so the pre-correction
+                           # array is freed once phase correction returns
     N       = info["matrix_size"]
     Nz      = info["Nz"]
     n_spec  = info["n_spec"]
@@ -1124,10 +1208,31 @@ def main():
         info["kz_cpp_per_ring"],
         gamma_mhz_per_mt, info["fov_m"], N)
 
+    # Match the MATLAB reference recon (reconUsingDFT_2D_splitCoils_VE ->
+    # CONCEPTPerform2DDirectFT), which reconstructs on a FIXED PHYSICAL FOV using
+    # k in cycles/pixel = k_phys * FoV/N — whose outer ring reaches k_norm_max_phys
+    # (< 0.5), NOT the max-normalized ±0.5 that build_trajectory_3d returns.
+    # With max-norm the recon FOV = nominal * (0.5/k_norm_max) is ring-count
+    # dependent, which magnifies low-ring scans and shifts an off-centre source by
+    # ~1 voxel between e.g. 5-ring and 80-ring acquisitions. Rescaling the in-plane
+    # axes back to physical makes the FOV — and hence voxel registration — identical
+    # for any ring count (the MATLAB DFT gives the same map for 5 and 80 rings).
+    # kz is already normalized to cycles/pixel, so it is left unscaled. NOTE:
+    # build_trajectory_3d itself is unchanged (05d imports it and relies on the
+    # max-norm convention for its own NUFFT grid).
+    _kxy_phys = float(info["k_norm_max_phys"]) / 0.5
+    traj = traj.copy()
+    traj[:, 0] *= _kxy_phys
+    traj[:, 1] *= _kxy_phys
+    print(f"[iter3d] Trajectory rescaled to PHYSICAL cycles/pixel "
+          f"(in-plane x{_kxy_phys:.3f}, outer ring -> {float(info['k_norm_max_phys']):.4f}) "
+          f"— fixed-FOV recon matching MATLAB CONCEPTPerform2DDirectFT")
+
     # ── 4. Flatten kdata: (n_kpts, n_spec, n_ch) ──────────────────────────
     # kdata shape: (pts_per_ring, n_spec, n_ch, n_rings_total)
     n_ch = kdata.shape[2]
     kdata_flat_mc = kdata.transpose(3, 0, 1, 2).reshape(-1, n_spec, n_ch)
+    del kdata   # flat copy is independent; free the (pts, spec, ch, rings) array
     print(f"[iter3d] kdata_flat_mc: {kdata_flat_mc.shape}  (n_kpts, n_spec, n_ch={n_ch})")
 
     # ── 5. FOV shift ───────────────────────────────────────────────────────
@@ -1149,15 +1254,19 @@ def main():
     t0 = time.time()
     # MATLAB applies the Hamming term on physical in-plane radius (not max-normalized 0.5 radius).
     # Build that radius from the NUFFT trajectory scale factor.
+    # traj is now in PHYSICAL cycles/pixel (rescaled above), so r_xy already equals
+    # the physical radius the Hamming taper expects — no extra k_norm_max_phys/0.5
+    # factor (that conversion is now baked into traj).
     r_xy = np.sqrt(traj[:, 0]**2 + traj[:, 1]**2)
-    ham_radius = r_xy * (float(info["k_norm_max_phys"]) / 0.5)
+    ham_radius = r_xy
 
     recon_fid, adj_raw_fid, adj_dcf_fid = iterative_recon_3d(
         kdata_flat_mc, traj,
         N, N, Nz, n_spec, n_ch=n_ch,
         noise_cov=info.get("noise_cov", None),
         dcf_hamming_radius=ham_radius,
-        maxiter=args.maxiter, lam=args.lam, rtol=args.rtol)
+        maxiter=args.maxiter, lam=args.lam, rtol=args.rtol,
+        use_dft=(args.recon_method == "dft"))
     print(f"[iter3d] Reconstruction done in {time.time()-t0:.1f}s")
 
     # Gaussian apodization before FFT: exp(-π²·lb²·t²/(4·ln2))
@@ -1188,7 +1297,8 @@ def main():
 
     # ── 9. Figures ─────────────────────────────────────────────────────────
     plot_results_3d(adj_dcf_spec, recon_spec, PPM, args.ppmlim, fig_dir,
-                    tag=rep_tag, adj_raw_spec=adj_raw_spec)
+                    tag=rep_tag, adj_raw_spec=adj_raw_spec,
+                    apodization_hz=args.apodization)
 
     if args.localizer:
         try:

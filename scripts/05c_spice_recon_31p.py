@@ -163,13 +163,20 @@ def compute_fov_shift(info):
 # ── Spatial regularization (from utils/graph.py) ────────────────────────
 
 def calc_Bmatrix_simple(ref_img, wmax=5e4, adj=8, mask=None, out_edge_scale=10.0,
-                        mask_dilation=1, hard_boundary=False, return_graph=False):
+                        mask_dilation=1, hard_boundary=False, return_graph=False,
+                        label_mask=None):
     """Graph Laplacian regularization from reference image.
 
     If mask (bool array [xi,yi] from roi_selector) is given, edges that cross
     the ROI boundary are attenuated. By default this uses a soft boundary
     (optionally with dilation). With hard_boundary=True, any edge not fully
     inside ROI is set to zero so ROI support is exact.
+
+    If label_mask (int array [xi,yi]; 0=background, 1..K=regions) is given, the
+    graph is HARD-separated: an edge is kept only when both endpoints share the
+    same nonzero label. Edges between different labels, and any edge touching
+    background, are zeroed — so each labelled region (e.g. GM vs soleus) is
+    reconstructed independently with no cross-smoothing. This overrides `mask`.
     """
     from scipy.ndimage import binary_dilation
 
@@ -183,6 +190,13 @@ def calc_Bmatrix_simple(ref_img, wmax=5e4, adj=8, mask=None, out_edge_scale=10.0
     old_err = np.seterr(divide='ignore')
     W = np.minimum(1.0 / C, wmax)
     np.seterr(**old_err)
+
+    if label_mask is not None:
+        # roi_selector stores [xi, yi]; image/graph order is [row=yi, col=xi] -> .T
+        lab_flat = np.asarray(label_mask).T.reshape(-1).astype(np.int64)
+        keep = (lab_flat[Nb[:, 0]] == lab_flat[Nb[:, 1]]) & (lab_flat[Nb[:, 0]] != 0)
+        W = W.copy()
+        W[~keep] = 0.0   # hard region separation: only same-nonzero-label edges survive
 
     if mask is not None:
         # roi_selector stores mask[xi, yi]; numpy [row=yi, col=xi] order needs .T
@@ -283,7 +297,7 @@ def load_localizer_registered(dcm_path, N, fov_mm, pos_sag, pos_cor, pos_tra=0.0
           f"  origin=({L0:.1f}, {P0:.1f}) LPS")
 
     vox_size = fov_mm / N
-    ctr = N // 2
+    ctr = (N - 1) / 2.0   # voxel-center convention (correct for even N; matches MATLAB gold-standard grid)
     xis = np.arange(N)
     yis = np.arange(N)
     xi_2d, yi_2d = np.meshgrid(xis, yis)   # xi_2d[r, c] = c,  yi_2d[r, c] = r
@@ -395,8 +409,13 @@ def generate_training_data(n_spec, dwell_s, larmor_mhz, n_training=5000):
 
 
 # PK_3T_Skeletal_2Pi multiplet definitions (from PK_3T_Skeletal_2Pi.m)
-# Each entry: (name, center_ppm, lw_init_hz, amp_range, components)
+# Each entry: (name, center_ppm, lw_init_hz, amp_range, components, cs_bounds)
 # components: list of (delta_ppm_from_center, relative_weight)
+# cs_bounds:  (lo, hi) chemShift bounds in ppm from the source .m Bounds block,
+#             or None to pin the peak at center_ppm. Only used when the training
+#             generator is asked to sample peak positions (--pi-ph-range): the
+#             center is then drawn uniformly within (lo, hi) per training FID so
+#             the subspace can represent a shifting peak (e.g. Pi tracking pH).
 # Doublet convention: peaks at center ± J/2 (separation = J)
 # Triplet 1:2:1 convention: peaks at center - J, center, center + J
 _DELTA_BETA  = 15.0 / 51.0   # β-ATP triplet spacing  (ppm)
@@ -404,36 +423,48 @@ _DELTA_ALPHA = 16.0 / 51.0   # α-ATP doublet spacing  (ppm)
 _DELTA_GAMMA = 15.0 / 51.0   # γ-ATP doublet spacing  (ppm)
 
 PK2PI_METABOLITES = [
-    # singlets
-    ("PCr",  0.0,    5.0,  (1.5, 2.5),  [(0.0, 1.0)]),
-    ("Pi",   4.85,   5.0,  (0.0, 0.8),  [(0.0, 1.0)]),
-    ("Pi2",  4.25,  10.0,  (0.0, 0.5),  [(0.0, 1.0)]),
-    ("PDE",  3.07,  30.0,  (0.0, 0.15), [(0.0, 1.0)]),
+    # singlets                                              cs_bounds (from .m)
+    ("PCr",  0.0,    5.0,  (1.5, 2.5),  [(0.0, 1.0)],  None),
+    # SINGLE pH-shifting Pi: one resonance whose center moves with pH across the
+    # full acidic→alkaline span (old Pi2..Pi range). NOT a fixed Pi/Pi2 doublet.
+    # Requires --pi-ph-range so cs_bounds is sampled per training FID.
+    ("Pi",   4.85,   5.0,  (0.0, 0.9),  [(0.0, 1.0)],  (4.3, 5.1)),
+    ("PDE",  3.07,  30.0,  (0.0, 0.15), [(0.0, 1.0)],  None),
     # γ-ATP doublet: peaks at center ± delta/2
     ("gATP", -2.53,  10.0, (0.5, 1.5),
-     [(-_DELTA_GAMMA / 2, 1.0), (_DELTA_GAMMA / 2, 1.0)]),
+     [(-_DELTA_GAMMA / 2, 1.0), (_DELTA_GAMMA / 2, 1.0)],  None),
     # α-ATP doublet: peaks at center ± delta/2
     ("aATP", -7.58,  10.0, (0.5, 1.5),
-     [(-_DELTA_ALPHA / 2, 1.0), (_DELTA_ALPHA / 2, 1.0)]),
+     [(-_DELTA_ALPHA / 2, 1.0), (_DELTA_ALPHA / 2, 1.0)],  None),
     # β-ATP triplet 1:2:1: peaks at center ± delta and center
     ("bATP", -15.86, 10.0, (0.5, 1.5),
-     [(-_DELTA_BETA, 0.5), (0.0, 1.0), (_DELTA_BETA, 0.5)]),
+     [(-_DELTA_BETA, 0.5), (0.0, 1.0), (_DELTA_BETA, 0.5)],  None),
 ]
 
 
-def generate_training_data_pk2pi(n_spec, dwell_s, larmor_mhz, n_training=5000):
-    """Synthetic 31P FIDs using PK_3T_Skeletal_2Pi multiplet structure (J-coupling)."""
+def generate_training_data_pk2pi(n_spec, dwell_s, larmor_mhz, n_training=5000,
+                                 pi_ph_range=False):
+    """Synthetic 31P FIDs using PK_3T_Skeletal_2Pi multiplet structure (J-coupling).
+
+    pi_ph_range: if True, peaks with cs_bounds defined (Pi, Pi2) have their
+        center drawn uniformly within their source-.m chemShift bounds per FID,
+        so the subspace spans a shifting Pi (pH degree of freedom). If False,
+        every peak sits at its fixed initial-value center (original behaviour).
+    """
     rng = np.random.default_rng(42)
     t = np.arange(n_spec) * dwell_s
     training = np.zeros((n_training, n_spec), dtype=np.complex64)
     for i in range(n_training):
         sig = np.zeros(n_spec, dtype=np.complex128)
-        for name, center_ppm, lw_init, amp_range, components in PK2PI_METABOLITES:
+        for name, center_ppm, lw_init, amp_range, components, cs_bounds in PK2PI_METABOLITES:
             amp = rng.uniform(*amp_range)
             lw  = rng.uniform(lw_init * 0.5, min(50.0, lw_init * 3.0))
             phase = rng.uniform(0, 2 * np.pi)
+            center = center_ppm
+            if pi_ph_range and cs_bounds is not None:
+                center = rng.uniform(*cs_bounds)      # sample position across bounds
             for delta_ppm, weight in components:
-                freq_hz = (center_ppm + delta_ppm) * larmor_mhz
+                freq_hz = (center + delta_ppm) * larmor_mhz
                 sig += (amp * weight * np.exp(1j * phase)
                         * np.exp(-lw * np.pi * t)
                         * np.exp(2j * np.pi * freq_hz * t))
@@ -686,6 +717,10 @@ def parse_args():
     p.add_argument("--subspace-src", default="adjoint",
                    choices=["adjoint", "csi", "synthetic", "pk2pi", "basis-dat"],
                    help="Subspace source: adjoint, csi, synthetic, pk2pi (PK_3T_Skeletal_2Pi multiplets), or basis-dat")
+    p.add_argument("--pi-ph-range", action="store_true",
+                   help="pk2pi only: sample Pi/Pi2 centers across their source-.m "
+                        "chemShift bounds (Pi 4.3-5.1, Pi2 3.9-4.3 ppm) so the "
+                        "subspace can represent a pH-shifting Pi (needs higher rank)")
     p.add_argument("--basis-dat", default=None,
                    help="Reference .dat file for subspace (--subspace-src basis-dat)")
     p.add_argument("--csi-prior", default=None,
@@ -702,6 +737,12 @@ def parse_args():
                    help="Enable automatic localizer segmentation for spatial prior (default: on)")
     p.add_argument("--roi-mask", default=None,
                    help="Path to .npy boolean mask (NxN) from roi_selector_31p.py")
+    p.add_argument("--roi-label-mask", default=None,
+                   help="Path to .npy INTEGER label mask (NxN): 0=background, 1..K=regions "
+                        "(e.g. GM/soleus). HARD-separates regions: graph edges between "
+                        "different labels (and edges touching background) are zeroed, so each "
+                        "region is reconstructed independently with no cross-smoothing. "
+                        "Its nonzero support is also used as the ROI for the prior.")
     p.add_argument("--wmax", type=float, default=5e4, help="Max edge weight for spatial prior")
     p.add_argument("--roi-edge-scale", type=float, default=10.0,
                    help="Cross/outside ROI edge attenuation factor in graph prior. "
@@ -746,6 +787,7 @@ def main():
     # ── 1. Load raw data ────────────────────────────────────────────
     info = load_concept_twix_3d(args.dat, rep_sel=args.rep)
     kdata   = info["kdata"]          # (pts_per_ring, n_spec, 1, n_rings)
+    info["kdata"] = None             # free the dict's ref after phase correction
     N       = info["matrix_size"]
     n_spec  = info["n_spec"]
     n_rings = info["n_rings"]
@@ -762,10 +804,23 @@ def main():
 
     # ── 3. Trajectory (max-normalised to [-0.5, 0.5]) ───────────────
     traj = build_trajectory_2d(info["first_circle"], n_rings, traj_pts)
-    print(f"[spice] traj: {len(traj)} k-pts  kx=[{traj[:,0].min():.3f},{traj[:,0].max():.3f}]")
+    # Reconstruct on a FIXED PHYSICAL FOV (matching the MATLAB reference recon
+    # CONCEPTPerform2DDirectFT): rescale the max-normalized trajectory (outer ring
+    # -> ±0.5) back to physical cycles/pixel (outer -> k_norm_max_phys < 0.5). With
+    # max-norm the recon FOV = nominal*(0.5/k_norm_max) is ring-count dependent,
+    # which magnifies low-ring scans and shifts an off-centre source by ~1 voxel
+    # between e.g. 5-ring and 80-ring; physical scaling makes the FOV (and voxel
+    # registration) identical for any ring count.
+    traj = traj.copy()
+    traj[:, 0] *= float(info["k_norm_max_phys"]) / 0.5
+    traj[:, 1] *= float(info["k_norm_max_phys"]) / 0.5
+    print(f"[spice] traj (physical cyc/pix): {len(traj)} k-pts  "
+          f"kx=[{traj[:,0].min():.3f},{traj[:,0].max():.3f}]  "
+          f"outer->{float(info['k_norm_max_phys']):.4f}")
 
     # ── 4. FOV shift ────────────────────────────────────────────────
     kdata_flat = kdata[:, :, 0, :].transpose(2, 0, 1).reshape(-1, n_spec)
+    del kdata   # flat copy is independent; free the (pts, spec, ch, rings) array
     if not args.no_fov_shift:
         d_pe, d_ro = compute_fov_shift(info)
         d_ro += args.extra_shift_ro
@@ -775,9 +830,10 @@ def main():
         print(f"[spice] FOV shift: pe={d_pe:.4f}, ro={d_ro:.4f} vox")
 
     # ── 5. DCF (Hamming CRT, matches op_CalcAndApplyDensComp.m) ────
-    # Match 06c: evaluate Hamming on physical ring radius (not max-normalized 0.5 radius).
+    # traj is now physical cyc/pix (rescaled above), so r_xy IS the physical ring
+    # radius the Hamming taper expects — the k_norm_max_phys/0.5 factor is baked in.
     r_xy = np.sqrt(traj[:, 0]**2 + traj[:, 1]**2)
-    ham_radius = r_xy * (float(info["k_norm_max_phys"]) / 0.5)
+    ham_radius = r_xy
     dcf = compute_crt_dcf_hamming(traj, hamming_radius=ham_radius)
     print(f"[spice] DCF weights: min={dcf.min():.4f}  max={dcf.max():.4f}")
 
@@ -812,8 +868,11 @@ def main():
         ref_traj_pts = int(ref_info["traj_pts"].max())
         ref_traj = build_trajectory_2d(
             ref_info["first_circle"], ref_info["n_rings"], ref_traj_pts)
+        ref_traj = ref_traj.copy()   # physical FOV rescale (see main traj above)
+        ref_traj[:, 0] *= float(ref_info["k_norm_max_phys"]) / 0.5
+        ref_traj[:, 1] *= float(ref_info["k_norm_max_phys"]) / 0.5
         ref_r_xy = np.sqrt(ref_traj[:, 0]**2 + ref_traj[:, 1]**2)
-        ref_ham_radius = ref_r_xy * (float(ref_info["k_norm_max_phys"]) / 0.5)
+        ref_ham_radius = ref_r_xy
         ref_dcf = compute_crt_dcf_hamming(ref_traj, hamming_radius=ref_ham_radius)
         ref_nufft = mrinufft.get_operator(
             "finufft", samples=ref_traj, shape=(ref_N, ref_N),
@@ -839,17 +898,24 @@ def main():
         print("[spice] Using CSI phantom prior for subspace ...")
         training = load_csi_prior(args.csi_prior, n_spec, dwell_s)
     else:  # "synthetic" or "pk2pi"
-        cache_name = ("training_data_pk2pi.npy" if args.subspace_src == "pk2pi"
-                      else "training_data.npy")
+        if args.subspace_src == "pk2pi":
+            cache_name = ("training_data_pk2pi_phrange.npy" if args.pi_ph_range
+                          else "training_data_pk2pi.npy")
+        else:
+            cache_name = "training_data.npy"
         training_cache = os.path.join(data_dir, cache_name)
         if os.path.exists(training_cache):
             print(f"[spice] Loading cached training data: {training_cache}")
             training = np.load(training_cache)
         else:
             if args.subspace_src == "pk2pi":
-                print(f"[spice] Generating {args.training_size} PK2Pi multiplet training FIDs ...")
+                mode = ("Pi/Pi2 pH-range sampling" if args.pi_ph_range
+                        else "fixed centers")
+                print(f"[spice] Generating {args.training_size} PK2Pi multiplet "
+                      f"training FIDs ({mode}) ...")
                 training = generate_training_data_pk2pi(
-                    n_spec, dwell_s, larmor_mhz, args.training_size)
+                    n_spec, dwell_s, larmor_mhz, args.training_size,
+                    pi_ph_range=args.pi_ph_range)
             else:
                 print(f"[spice] Generating {args.training_size} synthetic 31P training FIDs ...")
                 training = generate_training_data(
@@ -930,7 +996,17 @@ def main():
         spatial_prior = mag_norm
         _prior_label  = "31P adjoint mag"
 
-    if args.roi_mask:
+    label_mask = None
+    if args.roi_label_mask:
+        label_mask = np.load(args.roi_label_mask).astype(np.int64)
+        if label_mask.shape != (N, N):
+            sys.exit(f"[spice] label mask shape {label_mask.shape} != ({N},{N})")
+        roi = label_mask > 0
+        _labs = [int(l) for l in np.unique(label_mask) if l != 0]
+        print(f"[spice] HARD label-separated graph: labels {_labs} "
+              f"(sizes {[int((label_mask==l).sum()) for l in _labs]}), "
+              f"{int(roi.sum())}/{N*N} voxels; cross-label & background edges zeroed")
+    elif args.roi_mask:
         roi = np.load(args.roi_mask).astype(bool)
         if roi.shape != (N, N):
             sys.exit(f"[spice] ROI mask shape {roi.shape} != ({N},{N})")
@@ -998,6 +1074,23 @@ def main():
     plt.close(_fig_sp)
     print(f"[spice] Saved spatial prior map -> {fig_dir}/spatial_prior_map.png")
 
+    # Side-by-side diagnostic to make orientation equivalence explicit.
+    if args.localizer:
+        _fig_or, (_ax_or0, _ax_or1) = plt.subplots(1, 2, figsize=(10, 4.5))
+        _ax_or0.imshow(anatomy_bg, origin='lower', cmap='gray', aspect='equal')
+        _ax_or0.set_title("Registered localizer")
+        _ax_or0.set_xlabel("x (voxel)")
+        _ax_or0.set_ylabel("y (voxel)")
+        _im_or = _ax_or1.imshow(spatial_prior_plot, origin='lower', cmap='Greens', aspect='equal')
+        plt.colorbar(_im_or, ax=_ax_or1)
+        _ax_or1.set_title("Spatial prior (same orientation)")
+        _ax_or1.set_xlabel("x (voxel)")
+        _ax_or1.set_ylabel("y (voxel)")
+        _fig_or.tight_layout()
+        _fig_or.savefig(os.path.join(fig_dir, "localizer_vs_prior_orientation_check.png"), dpi=150, bbox_inches='tight')
+        plt.close(_fig_or)
+        print(f"[spice] Saved orientation check -> {fig_dir}/localizer_vs_prior_orientation_check.png")
+
     # Pass roi as mask: cuts cross-boundary edges so inside/outside are decoupled.
     # Outside-ROI voxels get no regularization (free to take noise/leakage values).
     WW, B, A_graph = calc_Bmatrix_simple(
@@ -1005,7 +1098,8 @@ def main():
         out_edge_scale=args.roi_edge_scale,
         mask_dilation=args.roi_dilation,
         hard_boundary=args.roi_hard_boundary,
-        return_graph=True)
+        return_graph=True,
+        label_mask=label_mask)
 
     if roi is not None:
         if args.roi_hard_boundary:
@@ -1014,9 +1108,14 @@ def main():
             print(f"[spice] ROI graph boundary: soft (dilation={args.roi_dilation}, edge_scale={args.roi_edge_scale:g})")
 
     # 1H-like diagnostic: per-voxel sum of graph edge weights.
-    # This map is on the same scale family as the 1H "voxel-level sum prior map"
-    # and can naturally reach values near O(wmax * neighbor_count).
+    # This map can naturally reach O(wmax * neighbor_count) because each voxel
+    # aggregates up to 8 adjacent edge weights (adj=8).
     voxel_sum_map = np.sum(A_graph, axis=0).reshape(N, N)
+    n_neighbors_max = 8.0
+    expected_max = float(args.wmax) * n_neighbors_max
+    vmax_actual = float(voxel_sum_map.max())
+    print(f"[spice] Graph weight-sum max={vmax_actual:.3g} (expected scale <= {expected_max:.3g} for adj=8)")
+
     _fig_vs, _ax_vs = plt.subplots(figsize=(6, 5))
     _im_vs = _ax_vs.imshow(voxel_sum_map, origin='lower', cmap='Greens', aspect='equal')
     plt.colorbar(_im_vs, ax=_ax_vs)
@@ -1027,6 +1126,30 @@ def main():
     _fig_vs.savefig(os.path.join(fig_dir, "spatial_prior_voxel_sum_map.png"), dpi=150, bbox_inches='tight')
     plt.close(_fig_vs)
     print(f"[spice] Saved graph weight-sum prior map -> {fig_dir}/spatial_prior_voxel_sum_map.png")
+
+    voxel_sum_norm = np.clip(voxel_sum_map / (expected_max + 1e-12), 0.0, 1.0)
+    _fig_vsn, _ax_vsn = plt.subplots(figsize=(6, 5))
+    _im_vsn = _ax_vsn.imshow(voxel_sum_norm, origin='lower', cmap='Greens', aspect='equal', vmin=0.0, vmax=1.0)
+    plt.colorbar(_im_vsn, ax=_ax_vsn, label="normalized weight sum")
+    _ax_vsn.set_title("Voxel-level sum prior map (graph weights, normalized)", fontsize=11)
+    _ax_vsn.set_xlabel("x (voxel)")
+    _ax_vsn.set_ylabel("y (voxel)")
+    _fig_vsn.tight_layout()
+    _fig_vsn.savefig(os.path.join(fig_dir, "spatial_prior_voxel_sum_map_normalized.png"), dpi=150, bbox_inches='tight')
+    plt.close(_fig_vsn)
+    print(f"[spice] Saved normalized graph weight-sum map -> {fig_dir}/spatial_prior_voxel_sum_map_normalized.png")
+
+    _fig_ov, _ax_ov = plt.subplots(figsize=(6, 5))
+    _ax_ov.imshow(spatial_prior_plot, origin='lower', cmap='gray', aspect='equal')
+    _ax_ov.contour(voxel_sum_norm, levels=[0.2, 0.4, 0.6, 0.8], colors='lime', linewidths=1.0, origin='lower')
+    _ax_ov.set_title("Prior + graph-weight contours (orientation check)", fontsize=11)
+    _ax_ov.set_xlabel("x (voxel)")
+    _ax_ov.set_ylabel("y (voxel)")
+    _fig_ov.tight_layout()
+    _fig_ov.savefig(os.path.join(fig_dir, "spatial_prior_graph_overlay.png"), dpi=150, bbox_inches='tight')
+    plt.close(_fig_ov)
+    print(f"[spice] Saved prior/graph overlay -> {fig_dir}/spatial_prior_graph_overlay.png")
+
     adj_spec = FIDToSpec(adj_fid_img.conj(), axis=-1)
 
     # ── 8b. Adjoint-only mode: plot spectra on anatomy and exit ────
