@@ -8,8 +8,10 @@ Conventions
 -----------
 - Image vectors are row-major flattened (row, col) grids, as in
   calc_Bmatrix_simple / spice_reconstruct in scripts/05c_spice_recon_31p.py.
-- k-space positions are in cycles per reconstruction voxel; traj[:, 0] = kx
-  pairs with the column index, traj[:, 1] = ky with the row index.
+- k-space positions are in cycles per reconstruction voxel; traj[:, 0] pairs
+  with the row index (image axis 0) and traj[:, 1] with the column index, as in
+  mri-nufft. On real data, E^H D y equals the 05c adjoint (mri-nufft, density=dcf)
+  up to a global scale.
 - The Gram matrix is E^H diag(dcf) E, the same weighted normal operator that
   05c builds column by column from the mri-nufft operator with density=dcf.
 """
@@ -85,7 +87,7 @@ def encoding_matrix(traj: np.ndarray, n: int, upsample: int = 1) -> np.ndarray:
     """
     c = voxel_centres(n, upsample)
     rows, cols = np.meshgrid(c, c, indexing="ij")
-    phase = np.outer(traj[:, 0], cols.ravel()) + np.outer(traj[:, 1], rows.ravel())
+    phase = np.outer(traj[:, 0], rows.ravel()) + np.outer(traj[:, 1], cols.ravel())
     return np.exp(-2j * np.pi * phase) / upsample**2
 
 

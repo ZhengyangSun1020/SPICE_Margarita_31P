@@ -24,11 +24,12 @@ from .phantom import PCR_PPM, PI_PPM, make_calf_phantom, peak_map, phantom_fids
 class SimConfig:
     grid_sizes: tuple = (8, 10, 12)       # CSI matrix sizes (CA-SPICE study: 8x8 and 10x10)
     upsample: int = 4                     # sub-pixels per voxel side for the ground truth
-    n_spec: int = 256
-    dwell_s: float = 1.0 / 2500.0         # spectral dwell (2.5 kHz bandwidth)
-    larmor_mhz: float = 49.9              # 31P at 2.89 T
+    # acquisition defaults from MID00276 (240 mm FOV, 10x10, CONCEPT CRT, 3T)
+    n_spec: int = 756
+    dwell_s: float = 360e-6               # spectral dwell (twix dwell x 2, as in 05c)
+    larmor_mhz: float = 49.894558
     rank: int = 12
-    pts_per_ring: int = 32
+    pts_per_ring: int = 60
     p_superres: float = 0.3               # acquire on a coarser grid than the CSI grid
     p_drop: float = 0.4                   # randomly discard rings (data_proc_06_undersample)
     drop_rate: tuple = (0.1, 0.4)
