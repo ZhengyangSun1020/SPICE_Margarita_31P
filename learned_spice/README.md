@@ -32,6 +32,7 @@ metabolite table and the CRT DCF from 05c (keep them in sync).
 | `data.py` | On-the-fly training pairs (fine-grid truth, random CRT operator, noise), all in the rank-r subspace |
 | `model.py` | Features, `EdgeWeightNet`, graph Laplacian (identical to `calc_Bmatrix_simple`), SPICE solve, uncertainty, export |
 | `train.py` | Training + comparison with SPICE baselines on a simulated test set |
+| `validate_ring_subsets.py` | Real-data check: ring subsets of an oversampled scan, scored by held-out k-space prediction |
 | `apply.py` | Apply a trained model to real data (`system.npz`, `adj_fid.npy`, `VD.npy`), static or dynamic |
 | `tests/` | Laplacian equals `calc_Bmatrix_simple`, export reproduces the solve, noise std matches Monte Carlo, CLI runs |
 
@@ -52,7 +53,11 @@ metabolite table and the CRT DCF from 05c (keep them in sync).
 
 ```bash
 pip install -e .                    # torch, numpy, scipy, matplotlib (already in pyproject)
-python -m learned_spice.train --out-dir output/learned_spice/run01            # ~15 min on 4 CPU cores
+python -m learned_spice.train --out-dir output/learned_spice/run02_mid276     # ~30 min on 4 CPU cores
+
+# real-data check on an oversampled CRT scan (needs pymapvbvd, mri-nufft for the 05c/06c loaders)
+python -m learned_spice.validate_ring_subsets --dat data/raw/meas_MID00276_FID221481_240FOV_10x10_80rings.dat \
+    --model output/learned_spice/run02_mid276/model.pt --rank 1 --out-dir output/learned_spice/mid276_validation
 python -m pytest learned_spice/tests -q
 
 # real data (static or dynamic adj_fid), e.g. a CA-SPICE study folder
@@ -67,22 +72,51 @@ The noise level matters, because the network sets the amount of regularisation f
 one adjoint-FID entry has std `σ · sqrt(sum(dcf²))`; pass that value, or `--sigma-k` with `--dcf`. Without either, `apply.py`
 falls back to a rough estimate from the FID tail and warns.
 
-## First result (simulation only)
+## Results
 
-`train.py` with the defaults: 3000 steps, about 12 min on 4 CPU cores. The test set is 192 held-out simulated slices (64 each of
-8×8, 10×10, 12×12). Values are means; lower is better. *rel. err* is the subspace FID error; *PCr* and *Pi* are the NRMSE of
-the peak-height maps inside the leg.
+### Simulation
+
+`train.py` with the defaults, which are the MID00276 acquisition parameters: 3000 steps, about 30 min on 4 CPU cores. The test
+set is 192 held-out simulated slices (64 each of 8×8, 10×10, 12×12). Values are means; lower is better. *rel. err* is the
+subspace FID error; *PCr* and *Pi* are the NRMSE of the peak-height maps inside the leg.
 
 | Method | rel. err | PCr | Pi | PCr (full) | PCr (ring-dropped) | PCr (super-res) |
 |---|---|---|---|---|---|---|
-| SPICE, λ = 0 | 1.21 | 0.296 | 1.17 | 0.250 | 0.332 | 0.340 |
-| SPICE, hand-crafted graph (λ tuned on validation) | 0.191 | 0.146 | 0.286 | 0.117 | 0.152 | 0.184 |
-| SPICE, hand-crafted graph (best λ per sample) | 0.175 | 0.140 | 0.263 | 0.111 | 0.146 | 0.177 |
-| **Learned SPICE** | **0.099** | **0.089** | **0.200** | **0.059** | **0.091** | **0.130** |
+| SPICE, λ = 0 | 0.806 | 0.307 | 0.729 | 0.277 | 0.382 | 0.325 |
+| SPICE, hand-crafted graph (λ tuned on validation) | 0.174 | 0.138 | 0.374 | 0.123 | 0.133 | 0.176 |
+| SPICE, hand-crafted graph (best λ per sample) | 0.159 | 0.128 | 0.365 | 0.115 | 0.123 | 0.162 |
+| **Learned SPICE** | **0.083** | **0.077** | **0.344** | **0.063** | **0.081** | **0.107** |
 
-The learned weights beat the hand-crafted graph even when its λ is tuned per sample, in every condition, with and without the
-guidance image. These numbers are from simulated data, from the same generator used for training. They do not yet show
-performance on real scans; see below.
+These numbers come from the same generator used for training.
+
+### Real data: MID00276, 80-ring 10×10 scan
+
+The 80 rings cover |k| ≤ 0.44 cycles/voxel, so the scan is heavily oversampled for a 10×10 grid.
+`validate_ring_subsets.py`:
+1. reconstructs from 4 disjoint ring subsets per condition;
+2. uses a spectral subspace from the SVD of the held-out rings' adjoint FIDs;
+3. scores each reconstruction by how well it predicts the held-out rings' measured k-space (DCF-weighted NMSE).
+
+A perfect reconstruction would score the noise floor; an all-zero reconstruction scores 1.0. The object shows only PCr, so
+its signal is essentially rank 1. The model is `run02_mid276`; there is no prior and no leg mask.
+
+| Rank 1, held-out NMSE (mean ± sd, 4 subsets) | 5 rings | 4 rings (4th dropped) | 3 rings (super-res) |
+|---|---|---|---|
+| noise floor | 0.299 | 0.299 | 0.300 |
+| SPICE, λ = 0 | 0.752 ± 0.034 | 11.4 ± 3.7 | 37.5 ± 10.5 |
+| SPICE, hand-crafted graph (λ from simulation) | 0.555 ± 0.039 | 0.569 ± 0.041 | 0.572 ± 0.034 |
+| **Learned SPICE** | **0.537 ± 0.041** | **0.557 ± 0.050** | **0.541 ± 0.040** |
+| SPICE, hand-crafted (λ chosen on the held-out data, optimistic) | 0.519 ± 0.029 | 0.522 ± 0.032 | 0.524 ± 0.030 |
+
+- **Rank 1.** The learned weights are slightly better than the hand-crafted graph with its simulation-tuned λ, but by less
+  than one standard deviation. They are worse than the hand-crafted graph with λ tuned on the held-out data itself.
+- **Rank 4** (three extra components that are pure noise). The learned weights are worse: 0.939 against 0.911 for 5 rings.
+  They under-regularise, and the maps show residual signal at the FOV edges where there is no tissue.
+
+The large advantage in simulation therefore does **not** carry over to this scan yet. Likely reasons:
+- the object (a compact, PCr-only phantom) is nothing like the simulated calves;
+- training used a PK2PI subspace, not a data-derived one;
+- no leg mask was given, so λ_out was not learned against a known support.
 
 ## Before trusting it on real data
 
