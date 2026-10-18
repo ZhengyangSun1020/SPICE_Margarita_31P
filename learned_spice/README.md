@@ -67,6 +67,23 @@ The noise level matters, because the network sets the amount of regularisation f
 one adjoint-FID entry has std `σ · sqrt(sum(dcf²))`; pass that value, or `--sigma-k` with `--dcf`. Without either, `apply.py`
 falls back to a rough estimate from the FID tail and warns.
 
+## First result (simulation only)
+
+`train.py` with the defaults: 3000 steps, about 12 min on 4 CPU cores. The test set is 192 held-out simulated slices (64 each of
+8×8, 10×10, 12×12). Values are means; lower is better. *rel. err* is the subspace FID error; *PCr* and *Pi* are the NRMSE of
+the peak-height maps inside the leg.
+
+| Method | rel. err | PCr | Pi | PCr (full) | PCr (ring-dropped) | PCr (super-res) |
+|---|---|---|---|---|---|---|
+| SPICE, λ = 0 | 1.21 | 0.296 | 1.17 | 0.250 | 0.332 | 0.340 |
+| SPICE, hand-crafted graph (λ tuned on validation) | 0.191 | 0.146 | 0.286 | 0.117 | 0.152 | 0.184 |
+| SPICE, hand-crafted graph (best λ per sample) | 0.175 | 0.140 | 0.263 | 0.111 | 0.146 | 0.177 |
+| **Learned SPICE** | **0.099** | **0.089** | **0.200** | **0.059** | **0.091** | **0.130** |
+
+The learned weights beat the hand-crafted graph even when its λ is tuned per sample, in every condition, with and without the
+guidance image. These numbers are from simulated data, from the same generator used for training. They do not yet show
+performance on real scans; see below.
+
 ## Before trusting it on real data
 
 1. **Match the simulation to the scans.** Set `n_spec`, the dwell time, the Larmor frequency, the points per ring and the
